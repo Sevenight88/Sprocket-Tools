@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>SprocketTools</AssemblyName>
+    <RootNamespace>SprocketTools</RootNamespace>
+    <Version>1.0.2</Version>
+    <Description>SprocketTools：上游 Quality of Life 1.8.1 的中文分叉，界面、提示与出图文字直接写中文。</Description>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- 需要一份 Sprocket 安装（BepInEx 6 IL2CPP 已首次启动过并生成 interop）。
+         构建时指定：dotnet build -p:GameDir="D:\Steam\steamapps\common\Sprocket" -->
+    <GameDir Condition="'$(GameDir)' == ''">$(SPROCKET_DIR)</GameDir>
+    <PathMap>$(MSBuildThisFileDirectory)=/tools/</PathMap>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="libs\BepInEx.Core.dll"><Private>false</Private></Reference>
+    <Reference Include="libs\BepInEx.Unity.IL2CPP.dll"><Private>false</Private></Reference>
+    <Reference Include="libs\0Harmony.dll"><Private>false</Private></Reference>
+    <Reference Include="libs\Il2CppInterop.Runtime.dll"><Private>false</Private></Reference>
+    <Reference Include="$(GameDir)\BepInEx\interop\*.dll"><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <Target Name="CheckSprocketGameDir" BeforeTargets="ResolveAssemblyReferences"
+          Condition="!Exists('$(GameDir)\BepInEx\interop') Or !Exists('$(GameDir)\BepInEx\core\BepInEx.Core.dll')">
+    <Error Text="GameDir 未设置或指向的目录没有可用的 BepInEx 6 IL2CPP（缺 BepInEx\interop 或 BepInEx\core\BepInEx.Core.dll）。当前值：'$(GameDir)'。请先给游戏装 BepInEx 6（IL2CPP 版）并启动一次生成 interop，然后用 -p:GameDir=&quot;你的 Sprocket 目录&quot; 或环境变量 SPROCKET_DIR 构建。" />
+  </Target>
+
+</Project>
