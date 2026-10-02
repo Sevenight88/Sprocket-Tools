@@ -3,9 +3,8 @@
 Sprocket 载具设计器的编辑工具集，中文界面，独立维护。当前版本 1.0.2，运行于 BepInEx 6（IL2CPP 版），
 验证环境为 Sprocket 0.2.55.5 + Unity 6000.3.21 + `6.0.0-be.788`。
 
-本仓库是一条独立维护的支线，代码源自上游 [Quality of Life](https://github.com/Hans21223/Sprocket-Quality-of-Life)
-（作者 Hans21223，MIT 许可），挂点架构、界面层与多项交互已经重做，功能取舍与发布节奏由本仓库决定；
-它不是上游的翻译版本，也不与上游同步。许可与署名见文末。
+本仓库是一条独立维护的支线，代码平行于上游 [Quality of Life](https://github.com/Hans21223/Sprocket-Quality-of-Life)，挂点架构、界面层与多项交互已经重做，功能取舍与发布节奏由本仓库决定；
+不与上游同步。许可与署名见文末。
 
 ## 功能
 
@@ -152,5 +151,6 @@ dotnet build SprocketTools.csproj -c Release -p:GameDir="D:\Steam\steamapps\comm
 
 ## 许可与署名
 
-MIT。本仓库的修改与新增部分 © 2026 Sevenight，声明见 `LICENSE`；
-上游 `Quality of Life` © 2026 Hans21223 的 MIT 许可原文见 `LICENSE.upstream.txt`。再分发时请一并保留这两份文件。
+MIT。本仓库的修改与新增部分
+© 2026 Sevenight，声明见 `LICENSE`；
+© 2026 Hans21223 的 MIT 许可原文见 `LICENSE.upstream.txt`。再分发时请一并保留这两份文件。
