@@ -27,6 +27,8 @@ public sealed class Plugin : BasePlugin
     internal static ConfigEntry<bool>? DrawingElevation, DrawingTraverse, DrawingBlue, DrawingTurretTraverse;
     internal static ConfigEntry<bool>? DrawingCreaseNormals;
     internal static ConfigEntry<bool>? DrawingSeamFilter;
+    internal static ConfigEntry<bool>? DrawingAntiAliasing;
+    internal static ConfigEntry<bool>? DrawingDevMode;
     internal static ConfigEntry<bool>? DrawingGrid;
     internal static ConfigEntry<float>? DrawingGridIntensity;
     internal static ConfigEntry<string>? DrawingHiddenGunLimits;
@@ -47,6 +49,8 @@ public sealed class Plugin : BasePlugin
         DrawingIntensity = Config.Bind("Drawing sheet", "Wireframe intensity percent", 100f, "F9 图纸上几何线稿的浓度，0 至 100。涂装、尺寸标注与文字保持原有浓度。");
         DrawingCreaseNormals = Config.Bind("Drawing sheet", "Creases from shading normals", false, "F9 线稿改按网格自己烘好的顶点法线判断硬边，而不是按每个三角形的几何法线：光滑着色的圆弧面（炮塔弧面、翼子板圆角）不再画出分面棱，真硬边照旧。默认关闭。");
         DrawingSeamFilter = Config.Bind("Drawing sheet", "Hide plate joints", false, "F9 线稿隐去装甲板对拼的拼接缝：一条开边的另一侧若被另一块网格以同高同向的面接住，就不画。车体外轮廓与折棱不受影响；与板面齐平的舱盖边线也会一并消失。默认关闭。");
+        DrawingAntiAliasing = Config.Bind("Drawing sheet", "Line anti-aliasing", false, "F9 线条图（和由它生成的蓝图纸）按两倍分辨率重画再折回：每个像素按线条盖住的比例上墨，斜边与圆弧上的阶梯换成浓淡。四个视图都要重画一遍，出图明显更慢；只影响线条图，彩色图与透视图的描边不变。默认关闭。");
+        DrawingDevMode = Config.Bind("Drawing sheet", "Developer mode", false, "开发者模式：F9 除了常规三张图，再补出同槽位的对照图，名字带“-开发者图纸”后缀——“名称-开发者图纸（彩色图）／（透视图）”仍用背景那层品红供色（常规版已改成黑底供色，这两张用来看品红晕开的那条边），开着抗锯齿时另出“名称-开发者图纸”即未做抗锯齿的线条图；并在日志给出品红像素数、两趟颜色差异、半色像素占比与补拍耗时。默认关闭。");
         DrawingElevation = Config.Bind("Drawing sheet", "Gun elevation and depression", false, "侧视图中用虚线标出瞄准驱动上下极限处的火炮位置。不改动载具。");
         DrawingTraverse = Config.Bind("Drawing sheet", "Gun traverse", false, "顶视图中用虚线标出瞄准驱动左右极限处的火炮位置（含炮廓车型）。不改动载具。");
         DrawingTurretTraverse = Config.Bind("Drawing sheet", "Turret rotation", false, "顶视图中按方向机的最小/最大角度标出炮塔旋转。整周旋转画成 360 度圆弧。");

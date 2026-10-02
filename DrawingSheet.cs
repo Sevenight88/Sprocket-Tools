@@ -34,7 +34,11 @@ internal static class DrawingSheet
     const int BlockGap = 60;       // between the ruler and the title block (the name, guns and description) under it
     const int BlockLine = 16;      // between the title block's parts
     const int FirstSettle = 40, Settle = 12; // frames each view is left to draw fully (exposure, then anti-aliasing)
-    static readonly Color Behind = new(1, 0, 1); // drawn behind the vehicle to tell it apart: no paint is this magenta
+    const int ExtraSettle = 20;  // the passes after a view's own: more than Settle, so a changed backdrop has settled too
+    const int FineFactor = 2;    // the anti-aliased line pass: that many pixels across the same ground
+    // The colour key the backdrop is drawn with, and the black stand-in for it. The matte wants the bright key (its
+    // test is a ratio: green far below red and blue); the colours want nothing bright behind them to bleed into an edge.
+    static readonly Color Key = new(1f, 0f, 1f), DarkKey = new(0f, 0f, 0f);
 
     // Each view: the way the camera looks and the sheet's up. The vehicle's front is +z, its right +x.
     static readonly (string Name, Vector3 Look, Vector3 Up)[] Views =
@@ -74,6 +78,23 @@ internal static class DrawingSheet
                     if (!sheet.Aim(i)) yield break;
                     for (int f = 0; f < (i == 0 ? FirstSettle : Settle); f++) { sheet.Hold(); yield return null; }
                     if (!sheet.Grab(i, inside)) yield break;
+                    // The extra passes, after the grab the matte comes from: every view's colours against black (these are
+                    // what the sheets print), and, with anti-aliasing on, its matte again at finer pixels.
+                    sheet.ExtraOpen();
+                    if (sheet.antiAlias && !inside)
+                    {
+                        if (sheet.BeginFine(i))
+                        {
+                            for (int f = 0; f < ExtraSettle; f++) { sheet.Hold(); yield return null; }
+                            if (!sheet.EndFine(i)) { sheet.ExtraClose(); yield break; }
+                        }
+                    }
+                    sheet.SetKey(false);
+                    for (int f = 0; f < ExtraSettle; f++) { sheet.Hold(); yield return null; }
+                    bool coloursTaken = sheet.GrabColours(i, inside);
+                    sheet.SetKey(true);
+                    sheet.ExtraClose();
+                    if (!coloursTaken) yield break;
                 }
             }
             sheet.PutArmourBack(); // its shapes make the lines
@@ -125,10 +146,19 @@ internal static class DrawingSheet
         Bounds frame;
         float scale;                                   // pixels per metre, the same in every view
         readonly Drawing.View[] views = new Drawing.View[Views.Length];
-        readonly byte[][] colour = new byte[Views.Length][]; // RGB, rows from the bottom
+        readonly byte[][] colour = new byte[Views.Length][]; // RGB from the bright key, rows from the bottom: developer mode's pair
         readonly bool[][] solid = new bool[Views.Length][];  // the vehicle, not the backdrop
         readonly byte[][] insideColour = new byte[Views.Length][]; // the same with the armour off
         readonly bool[][] insideSolid = new bool[Views.Length][];
+        // The black backdrop's colours are what the sheets print. The developer mode adds grabs for comparison pictures.
+        internal readonly bool devMode = Plugin.DrawingDevMode?.Value ?? false;
+        internal readonly bool antiAlias = Plugin.DrawingAntiAliasing?.Value ?? false;
+        readonly byte[][] darkColour = new byte[Views.Length][];  // the frames against black: the colours, no key to bleed
+        readonly byte[][] darkInsideColour = new byte[Views.Length][];
+        readonly bool[][] fineSolid = new bool[Views.Length][];   // a view's matte again at FineFactor the pixels
+        RenderTexture? fine;                                      // the oversized target, only up while that is taken
+        HDAdditionalCameraData? hdData;                           // the drawing camera's own: where the key colour lives
+        long extraMs, extraBegin;                                 // wall clock in the extra passes
         readonly List<Renderer> armour = new();              // switched off for the see-through views
         Camera? cam;
         RenderTexture? target;
@@ -288,9 +318,10 @@ internal static class DrawingSheet
             if (main.GetComponent<HDAdditionalCameraData>() is { } hd)
             {
                 var own = go.AddComponent<HDAdditionalCameraData>();
+                hdData = own;
                 hd.CopyTo(own);
                 own.clearColorMode = HDAdditionalCameraData.ClearColorMode.Color;
-                own.backgroundColorHDR = Behind;
+                own.backgroundColorHDR = Key;
                 // Not temporal: each view is still, but the camera jumps between them.
                 own.antialiasing = HDAdditionalCameraData.AntialiasingMode.SubpixelMorphologicalAntiAliasing;
                 // No reflections: seen from above, the paint mirrored the sky and the map's grass round the editor.
@@ -314,7 +345,8 @@ internal static class DrawingSheet
             DesignEditor.Instance?.Say("工程图纸：正在拍摄各视图……", 10);
             Plugin.ModLog.LogInfo($"TOOL_DRAWING vehicle {size.x:0.00} x {size.y:0.00} x {size.z:0.00} m, {scale:0} px a metre, views " +
                                   string.Join(", ", views.Select((v, i) => $"{Views[i].Name} {v.Width}x{v.Height}")) + $", {aerials.Count} antenna pieces left out, {projectors.Count} decals, " +
-                                  (ownLayer >= 0 ? $"{movedLayers.Count} objects on layer {ownLayer} for the pictures" : "no free layer: the vehicle's own layers"));
+                                  (ownLayer >= 0 ? $"{movedLayers.Count} objects on layer {ownLayer} for the pictures" : "no free layer: the vehicle's own layers") +
+                                  $", colours from the black backdrop, anti-aliasing {(antiAlias ? "on" : "off")}, developer mode {(devMode ? "on" : "off")}");
             return true;
         }
 
@@ -379,35 +411,113 @@ internal static class DrawingSheet
             armourProjectors.Clear();
         }
 
+        /// The frame the camera last drew into `from`, as the camera's own pixels.
+        UnityEngine.Color32[] Read(int width, int height, RenderTexture? from)
+        {
+            var was = RenderTexture.active;
+            RenderTexture.active = from;
+            var picture = new Texture2D(width, height, TextureFormat.RGBA32, 1, false);
+            picture.ReadPixelsImpl(new Rect(0, 0, width, height), 0, 0, false);
+            RenderTexture.active = was;
+            var pixels = picture.GetPixels32();
+            UnityEngine.Object.Destroy(picture);
+            return pixels;
+        }
+
+        /// Whether a pixel is the backdrop: red and blue alike with green far below (the key, darker at the corners with
+        /// the game's vignette), and bright enough that a black shadow on the vehicle doesn't read as empty ground.
+        static bool IsKey(UnityEngine.Color32 c)
+        {
+            int lo = Math.Min(c.r, c.b), hi = Math.Max(c.r, c.b);
+            return lo > 30 && c.g < lo / 2 && hi - lo < hi * 0.35f;
+        }
+
+        static byte[] Rgb(UnityEngine.Color32[] pixels)
+        {
+            var rgb = new byte[pixels.Length * 3];
+            for (int p = 0; p < pixels.Length; p++) { rgb[p * 3] = pixels[p].r; rgb[p * 3 + 1] = pixels[p].g; rgb[p * 3 + 2] = pixels[p].b; }
+            return rgb;
+        }
+
         internal bool Grab(int i, bool inside)
         {
             try
             {
                 var v = views[i];
-                var was = RenderTexture.active;
-                RenderTexture.active = target;
-                var picture = new Texture2D(v.Width, v.Height, TextureFormat.RGBA32, 1, false);
-                picture.ReadPixelsImpl(new Rect(0, 0, v.Width, v.Height), 0, 0, false);
-                RenderTexture.active = was;
-                var pixels = picture.GetPixels32();
-                UnityEngine.Object.Destroy(picture);
-                var rgb = new byte[v.Width * v.Height * 3];
-                var mask = new bool[v.Width * v.Height];
-                for (int p = 0; p < mask.Length; p++)
-                {
-                    var c = pixels[p];
-                    rgb[p * 3] = c.r; rgb[p * 3 + 1] = c.g; rgb[p * 3 + 2] = c.b;
-                    // The magenta behind (darker at the corners, with the game's vignette): red and blue alike, green far below.
-                    int lo = Math.Min(c.r, c.b), hi = Math.Max(c.r, c.b);
-                    mask[p] = !(lo > 30 && c.g < lo / 2 && hi - lo < hi * 0.35f);
-                }
-                (inside ? insideColour : colour)[i] = rgb;
+                var pixels = Read(v.Width, v.Height, target);
+                var mask = new bool[pixels.Length];
+                for (int p = 0; p < pixels.Length; p++) mask[p] = !IsKey(pixels[p]);
+                (inside ? insideColour : colour)[i] = Rgb(pixels);
                 (inside ? insideSolid : solid)[i] = mask;
                 var corner = pixels[0];
                 Plugin.ModLog.LogInfo($"TOOL_DRAWING {Views[i].Name}{(inside ? $" (armour off, {armour.Count} pieces)" : "")}: backdrop drawn as ({corner.r}, {corner.g}, {corner.b}), {mask.Count(m => m) * 100 / mask.Length}% of the picture is the vehicle");
                 return true;
             }
             catch (Exception ex) { Fail($"无法拍摄{Views[i].Name}", ex); return false; }
+        }
+
+        // The passes beside the usual one: colours against black (what the sheets print), and, with anti-aliasing on, each
+        // view's matte again at finer pixels. The developer mode times them and puts the bright-key colours out to compare.
+        internal void ExtraOpen() { extraBegin = Environment.TickCount64; }
+        internal void ExtraClose() { extraMs += Environment.TickCount64 - extraBegin; }
+
+        /// The backdrop for the pass that follows: bright key while a matte is judged, black while colours are collected.
+        internal void SetKey(bool bright)
+        {
+            if (hdData != null) hdData.backgroundColorHDR = bright ? Key : DarkKey;
+        }
+
+        /// The same frame's colours once more, from whatever key is up now - against black, so no bright key bleeds into an
+        /// edge. These are the ones the sheets print. No judgement here: the matte stays the bright pass's, so nothing on
+        /// a sheet can move between the two.
+        internal bool GrabColours(int i, bool inside)
+        {
+            try
+            {
+                var v = views[i];
+                (inside ? darkInsideColour : darkColour)[i] = Rgb(Read(v.Width, v.Height, target));
+                return true;
+            }
+            catch (Exception ex) { Fail($"无法补拍{Views[i].Name}的颜色", ex); return false; }
+        }
+
+        /// `FineFactor` the pixels over the same ground: the camera has not moved, only its target gets bigger.
+        internal bool BeginFine(int i)
+        {
+            try
+            {
+                var v = views[i];
+                fine = new RenderTexture(v.Width * FineFactor, v.Height * FineFactor, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                cam!.targetTexture = fine;
+                return true;
+            }
+            catch (Exception ex) { Fail($"无法放大{Views[i].Name}", ex); return false; }
+        }
+
+        internal bool EndFine(int i)
+        {
+            try
+            {
+                var v = views[i];
+                var pixels = Read(v.Width * FineFactor, v.Height * FineFactor, fine);
+                var mask = new bool[pixels.Length];
+                for (int p = 0; p < pixels.Length; p++) mask[p] = !IsKey(pixels[p]);
+                fineSolid[i] = mask;
+                return true;
+            }
+            catch (Exception ex) { Fail($"无法补拍{Views[i].Name}的遮罩", ex); return false; }
+            finally
+            {
+                if (fine != null) { cam!.targetTexture = target; fine.Release(); UnityEngine.Object.Destroy(fine); fine = null; }
+            }
+        }
+
+        /// View `i` over the same ground with `FineFactor` the pixels each way: same centre, same scale in metres, so the
+        /// big picture's blocks stand exactly on the small one's pixels.
+        Drawing.View Fine(int i)
+        {
+            var v = views[i];
+            return new Drawing.View(v.Centre, v.Right, v.Up, v.Look, v.Scale * FineFactor, v.Width * FineFactor, v.Height * FineFactor);
         }
 
         /// The lines of every view, all three sheets put together and saved.
@@ -441,6 +551,58 @@ internal static class DrawingSheet
                 }
                 Plugin.ModLog.LogInfo($"TOOL_DRAW_SEAM 拼接缝：{(seams ? "已开" : "未开")}，四个视图共隐去开边 {seamsDropped}" +
                     $"（单视图开边 {shapes.Sum(s => s.E.Count(e => e.F2 < 0))}，阈值 {Drawing.SeamDepth * 1000:0} 毫米 / {Drawing.SeamDegrees:0} 度，探边 {Drawing.SeamProbe} 像素）");
+                // Anti-aliasing: each view's lines again at finer pixels, averaged down to one so a line over half a pixel
+                // prints half as dark. Same shapes, same rules - only the sampling is finer, and the silhouette comes from
+                // the oversized matte rather than from the 1x picture.
+                var cover = new float[Views.Length][];
+                int fineInk = 0, fineThick = 0, finePartial = 0, fineFull = 0, finePixels = 0;
+                if (antiAlias)
+                    for (int i = 0; i < Views.Length; i++)
+                    {
+                        if (fineSolid[i] == null) continue;
+                        var fv = Fine(i);
+                        var small = views[i];
+                        var depth2 = Drawing.Depths(shapes, fv);
+                        var solid2 = fineSolid[i];
+                        if (unreadable == 0) Drawing.Clip(solid2, depth2.Z, fv.Width, fv.Height, FineFactor * 3);
+                        var ink2 = new bool[fv.Width * fv.Height];
+                        Drawing.Lines(shapes, fv, depth2, ink2, seamFilter: seams);
+                        Drawing.Outline(solid2, fv.Width, fv.Height, ink2);
+                        // A line is one *sheet* pixel wide, so a sample taken at the finer resolution must paint a
+                        // FineFactor-by-FineFactor block; averaging a hairline straight through would print the whole
+                        // drawing half as dark, and the extra darkness belongs at the edge the sample really straddles.
+                        var thick = new bool[fv.Width * fv.Height];
+                        for (int y = 0; y < fv.Height; y++)
+                            for (int x = 0; x < fv.Width; x++)
+                            {
+                                if (!ink2[y * fv.Width + x]) continue;
+                                for (int dy = 0; dy < FineFactor; dy++)
+                                    for (int dx = 0; dx < FineFactor; dx++)
+                                    {
+                                        int yy = y + dy, xx = x + dx;
+                                        if (yy < fv.Height && xx < fv.Width) thick[yy * fv.Width + xx] = true;
+                                    }
+                            }
+                        cover[i] = new float[small.Width * small.Height];
+                        int dots = FineFactor * FineFactor;
+                        for (int y = 0; y < small.Height; y++)
+                            for (int x = 0; x < small.Width; x++)
+                            {
+                                int f = y * FineFactor * fv.Width + x * FineFactor, on = 0;
+                                for (int dy = 0; dy < FineFactor; dy++)
+                                    for (int dx = 0; dx < FineFactor; dx++)
+                                        if (thick[f + dy * fv.Width + dx]) on++;
+                                cover[i][y * small.Width + x] = on / (float)dots;
+                            }
+                        fineInk += ink2.Count(b => b); fineThick += thick.Count(b => b);
+                        finePartial += cover[i].Count(a => a > 0f && a < 1f);
+                        fineFull += cover[i].Count(a => a >= 1f);
+                        finePixels += cover[i].Length;
+                    }
+                if (devMode && antiAlias)
+                    Plugin.ModLog.LogInfo($"TOOL_DRAW_DEV 抗锯齿四视图合计：2× 着墨 {fineInk}，加粗后 {fineThick}，" +
+                        $"折回后部分覆盖 {finePartial}／{finePixels}，全黑 {fineFull}／{finePixels}" +
+                        (seams ? "；注意：拼接缝抑制开着，2× 那趟仍按 3 个细像素探边（=1.5 个图纸像素），判缝可能与 1× 略有出入" : ""));
                 // Top row: from above, then the front; below: the side, then the back (their bottoms level: the ground).
                 // Left of the views and under them, room for the dimensions; over each, its name; under them the ruler,
                 // and at the bottom the vehicle's name, guns and description.
@@ -465,18 +627,32 @@ internal static class DrawingSheet
                 Array.Fill(lines, (byte)255);
                 Array.Fill(painted, (byte)255);
                 Array.Fill(seeThrough, (byte)255);
+                // Developer mode's partners, built by the same hands: the colours from the bright key the matte is judged
+                // against, and, with anti-aliasing on, the line art from the plain sampling.
+                var paintedBright = new byte[w * h * 3];
+                var seeThroughBright = new byte[w * h * 3];
+                var plainLines = new byte[w * h * 3];
+                Array.Fill(paintedBright, (byte)255);
+                Array.Fill(seeThroughBright, (byte)255);
+                Array.Fill(plainLines, (byte)255);
+                int interior = 0, interiorDiff = 0, interiorMax = 0, hardInk = 0, hardMid = 0, softInk = 0, softMid = 0;
+                bool compare = devMode && antiAlias; // the plain-sampled line sheet is only worth having beside the smooth one
                 for (int i = 0; i < Views.Length; i++)
                 {
                     var v = views[i];
+                    var outside = darkColour[i] ?? colour[i]; // what the sheets print: no bright key behind an edge
+                    var within = darkInsideColour[i] ?? insideColour[i];
+                    var aa = cover[i];                        // this view's coverage, where anti-aliasing re-took it
                     for (int y = 0; y < v.Height; y++)
                         for (int x = 0; x < v.Width; x++)
                         {
                             int p = y * v.Width + x, q = ((at[i].Y + y) * w + at[i].X + x) * 3;
-                            if (ink[i][p]) DrawingOptions.Ink(lines, q, 0, intensity);
+                            if (aa != null) { float a = aa[p]; if (a > 0f) DrawingOptions.Ink(lines, q, 0, intensity * a); }
+                            else if (ink[i][p]) DrawingOptions.Ink(lines, q, 0, intensity);
                             bool shell = solid[i][p], core = insideSolid[i][p];
                             for (int c = 0; c < 3; c++)
                             {
-                                int paint = shell ? colour[i][p * 3 + c] : 255, under = core ? insideColour[i][p * 3 + c] : 255;
+                                int paint = shell ? outside[p * 3 + c] : 255, under = core ? within[p * 3 + c] : 255;
                                 painted[q + c] = (byte)paint;
                                 // Half the paint, half what's inside (white where there's nothing): the armour as glass.
                                 seeThrough[q + c] = (byte)((paint + under) / 2);
@@ -486,13 +662,40 @@ internal static class DrawingSheet
                                 if (colourOutline ? cleanOutlines[i][p] : ink[i][p]) DrawingOptions.Ink(painted, q, colourOutline ? (byte)65 : (byte)30, intensity);
                                 if (seeThroughOutline ? outlines[i][p] : ink[i][p]) DrawingOptions.Ink(seeThrough, q, 30, intensity);
                             }
+                            if (!devMode) continue;
+                            // The same matte and lines over the backdrop's own colour: what the sheets used to be.
+                            for (int c = 0; c < 3; c++)
+                            {
+                                int paint = shell ? colour[i][p * 3 + c] : 255, under = core ? insideColour[i][p * 3 + c] : 255;
+                                paintedBright[q + c] = (byte)paint;
+                                seeThroughBright[q + c] = (byte)((paint + under) / 2);
+                            }
+                            if (!noWireframe)
+                            {
+                                if (colourOutline ? cleanOutlines[i][p] : ink[i][p]) DrawingOptions.Ink(paintedBright, q, colourOutline ? (byte)65 : (byte)30, intensity);
+                                if (seeThroughOutline ? outlines[i][p] : ink[i][p]) DrawingOptions.Ink(seeThroughBright, q, 30, intensity);
+                            }
+                            if (compare && ink[i][p]) { DrawingOptions.Ink(plainLines, q, 0, intensity); hardInk++; if (plainLines[q] > 12) hardMid++; }
+                            if (aa != null && lines[q] < 244) { softInk++; if (lines[q] > 12) softMid++; }
+                            // Well inside the vehicle - its four neighbours drawn too - the two backdrops must agree.
+                            if (shell && x > 0 && y > 0 && x + 1 < v.Width && y + 1 < v.Height &&
+                                solid[i][p - 1] && solid[i][p + 1] && solid[i][p - v.Width] && solid[i][p + v.Width])
+                            {
+                                int diff = 0;
+                                for (int c = 0; c < 3; c++) diff = Math.Max(diff, Math.Abs(colour[i][p * 3 + c] - outside[p * 3 + c]));
+                                interior++;
+                                if (diff > 8) interiorDiff++;
+                                interiorMax = Math.Max(interiorMax, diff);
+                            }
                         }
                 }
-                DrawingOptions.DrawMotion(motion, new[] { lines, painted, seeThrough }, views, w, h, at);
-                foreach (var sheet in new[] { lines, painted, seeThrough }) Annotate(sheet, w, h, at, xLeft);
+                var sheets = new List<byte[]> { lines, painted, seeThrough };
+                if (devMode) { sheets.Add(paintedBright); sheets.Add(seeThroughBright); if (compare) sheets.Add(plainLines); }
+                DrawingOptions.DrawMotion(motion, sheets.ToArray(), views, w, h, at);
+                foreach (var sheet in sheets) Annotate(sheet, w, h, at, xLeft);
                 // The title block, from its top down, over a rule the width of the views.
                 if (blockHigh > 0)
-                    foreach (var sheet in new[] { lines, painted, seeThrough })
+                    foreach (var sheet in sheets)
                     {
                         Drawing.Box(sheet, w, h, xLeft, Margin + blockHigh + BlockGap / 2, xRight + right, Margin + blockHigh + BlockGap / 2 + 1, 0);
                         int top = Margin + blockHigh - 1;
@@ -512,13 +715,41 @@ internal static class DrawingSheet
                 Drawing.SavePng(name + "（透视图）.png", w, h, seeThrough);
                 if (blue) Drawing.SavePng(name + "（蓝图）.png", w, h,
                     DrawingOptions.Blueprint(lines, w, h, grid ? Math.Max(1, (int)MathF.Round(scale / 4)) : 0, gridStrength));
-                Plugin.ModLog.LogInfo($"TOOL_DRAWING saved {name}.png, (colour) and (see-through), {w}x{h}: {shapes.Count} shapes drawn, {unreadable} meshes the game keeps unreadable (outlined only); overlays: colour={(noWireframe ? "none" : colourOutline ? "outline" : "wireframe")}, see-through={(noWireframe ? "none" : seeThroughOutline ? "outline" : "wireframe")}; intensity={intensity:P0}, gun limits={motion.Count}, blue blueprint={blue}");
+                if (devMode)
+                {
+                    // The comparison sheets stand in the same slots as the usual three, so they take the developer
+                    // suffix rather than a description of what differs. Same name: the older sheet is replaced.
+                    var dev = Path.Combine(dir, safeName + "-开发者图纸");
+                    Drawing.SavePng(dev + "（彩色图）.png", w, h, paintedBright);
+                    Drawing.SavePng(dev + "（透视图）.png", w, h, seeThroughBright);
+                    if (compare) Drawing.SavePng(dev + ".png", w, h, plainLines);
+                }
+                Plugin.ModLog.LogInfo($"TOOL_DRAWING saved {name}.png, (colour) and (see-through), {w}x{h}: {shapes.Count} shapes drawn, {unreadable} meshes the game keeps unreadable (outlined only); overlays: colour={(noWireframe ? "none" : colourOutline ? "outline" : "wireframe")}, see-through={(noWireframe ? "none" : seeThroughOutline ? "outline" : "wireframe")}; intensity={intensity:P0}, gun limits={motion.Count}, blue blueprint={blue}, anti-aliasing={(antiAlias ? $"on at {FineFactor}x" : "off")}, colours from the black backdrop");
+                if (devMode)
+                    Plugin.ModLog.LogInfo($"TOOL_DRAW_DEV 品红像素：出厂（黑底供色）彩色 {Magenta(painted)}、透视 {Magenta(seeThrough)}；" +
+                        $"对照（品红底供色）彩色 {Magenta(paintedBright)}、透视 {Magenta(seeThroughBright)}；" +
+                        $"车身深处两趟颜色不一致 {interiorDiff}/{interior} 像素（最大单通道差 {interiorMax}）；" +
+                        (antiAlias ? $"线条着墨 1× {hardInk}（其中半色 {hardMid}）→ 抗锯齿 {softInk}（其中半色 {softMid}）；" : "抗锯齿未开；") +
+                        $"补拍共 {extraMs} 毫秒");
                 DesignEditor.Instance?.Say($"工程图纸已保存（线条图、彩色图、透视图{(blue ? "、蓝图" : "")}）：{name}.png", 8);
             }
             catch (Exception ex) { Fail("无法绘制图纸", ex); }
         }
 
         static void Set(byte[] rgb, int q, byte grey) { rgb[q] = grey; rgb[q + 1] = grey; rgb[q + 2] = grey; }
+
+        /// How much of a finished sheet still carries the backdrop's own colour: red and blue both up, green far below.
+        /// Counted on the picture rather than in the camera, so the number is what a player sees.
+        static int Magenta(byte[] rgb)
+        {
+            int n = 0;
+            for (int q = 0; q < rgb.Length; q += 3)
+            {
+                int lo = Math.Min(rgb[q], rgb[q + 2]);
+                if (lo > 60 && rgb[q + 1] * 2 < lo) n++;
+            }
+            return n;
+        }
 
         sealed class TitleBlockLayout
         {
@@ -783,7 +1014,7 @@ internal static class DrawingSheet
                 int col3High = 0;
                 if (!string.IsNullOrWhiteSpace(description))
                 {
-                    if (Drawing.Words("说明", 36, true, col3Width) is { } descHeaderWords)
+                    if (Drawing.Words("简介", 36, true, col3Width) is { } descHeaderWords)
                     {
                         col3Items.Add((col3High, descHeaderWords));
                         col3High += descHeaderWords.H + headerGap;
@@ -1034,7 +1265,8 @@ internal static class DrawingSheet
             hiddenGround.Clear();
             Restore("drawing camera", () => { if (cam != null) { cam.targetTexture = null; UnityEngine.Object.Destroy(cam.gameObject); } });
             Restore("render target", () => { if (target != null) { target.Release(); UnityEngine.Object.Destroy(target); } });
-            cam = null; target = null;
+            Restore("anti-aliasing target", () => { if (fine != null) { fine.Release(); UnityEngine.Object.Destroy(fine); } });
+            cam = null; target = null; hdData = null; fine = null;
             if (lightingCaptured)
             {
                 Restore("fullbright", () => { if (!fullbrightWas && MeshTools.FullbrightOn) MeshTools.ToggleFullbright(); });

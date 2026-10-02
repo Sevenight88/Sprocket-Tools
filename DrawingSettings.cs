@@ -56,6 +56,14 @@ public static class DrawingSettings
         {
             if (Plugin.DrawingSeamFilter != null) Plugin.DrawingSeamFilter.Value = v;
         }), "F9 线稿隐去装甲板对拼留下的拼接缝。车体由几十块独立装甲板拼成，每块四周都是开边，两板共面板对拼时深度与朝向都相同，线稿就把每条板缘都描出来。开启后：在开边另一侧 3 像素处取三个点，三点都被另一块网格以“高差小于 10 毫米、法线夹角小于 15°”的面接住，整条边判为拼接缝隐去。折棱与车体外轮廓照旧；与板面齐平、凸起不足 10 毫米的舱盖边线也会一并消失。默认关闭。");
+        ui.ToggleField("线条抗锯齿", Plugin.DrawingAntiAliasing?.Value ?? false, Ui.BoolCallback(v =>
+        {
+            if (Plugin.DrawingAntiAliasing != null) Plugin.DrawingAntiAliasing.Value = v;
+        }), "F9 的线条图（以及由它生成的蓝图纸）按两倍分辨率重画一遍再折回：每个像素按线条盖住的比例上墨，斜边和圆弧上的阶梯换成浓淡。四个视图都要重画，出图明显更慢；只影响线条图，彩色图与透视图上的描边不变。默认关闭。");
+        ui.ToggleField("开发者模式", Plugin.DrawingDevMode?.Value ?? false, Ui.BoolCallback(v =>
+        {
+            if (Plugin.DrawingDevMode != null) Plugin.DrawingDevMode.Value = v;
+        }), "开发者模式：常规三张图照常出，另外补出同槽位的对照图，名字带“-开发者图纸”后缀。其一，“名称-开发者图纸（彩色图）／（透视图）”——常规版供色已改成黑底（背景那层品红不再往轮廓里晕出一条边），这两张保留旧的品红底供色好比对差别。其二，开着抗锯齿时另出“名称-开发者图纸”，即未做抗锯齿的线条图。日志同时给出品红像素数、黑底与品红底两趟颜色的逐像素差异、半色像素占比与补拍耗时。平时请关掉。");
         ui.ToggleField("火炮俯仰角", Plugin.DrawingElevation?.Value ?? false,
             Ui.BoolCallback(v => { if (Plugin.DrawingElevation != null) Plugin.DrawingElevation.Value = v; }),
             "侧视图：用虚线画出瞄准驱动极限处的火炮位置，并标注角度。不会改动载具。");
