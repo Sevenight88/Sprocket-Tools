@@ -51,12 +51,18 @@ internal static class DrawingSheet
 
     static bool busy;
 
+    /// True while F9's views are being taken: nothing of ours starts on top of a sheet in the making.
+    internal static bool Capturing => busy;
+
     internal static void Update()
     {
-        if (busy || PhotoShot.Capturing || Keyboard.current is not { } keys || !keys.f9Key.wasPressedThisFrame || MeshTools.Typing()) return;
+        if (busy || PhotoShot.Capturing || Card.Capturing || Keyboard.current is not { } keys || !keys.f9Key.wasPressedThisFrame || MeshTools.Typing()) return;
         if (DesignEditor.Instance is not { } editor) return;
+        if (editor.Core?.Editor?.OperationInProgress == true) return; // the game is mid-operation: its views would be taken half-changed
         busy = true;
-        editor.StartCoroutine(Run().WrapToIl2Cpp());
+        // A coroutine that never started must not leave busy true for the rest of the session.
+        try { editor.StartCoroutine(Run().WrapToIl2Cpp()); }
+        catch { busy = false; NoHover.On = false; throw; }
     }
 
     static System.Collections.IEnumerator Run()
@@ -161,6 +167,7 @@ internal static class DrawingSheet
         long extraMs, extraBegin;                                 // wall clock in the extra passes
         readonly List<Renderer> armour = new();              // switched off for the see-through views
         Camera? cam;
+        GameObject? cameraObject;                     // its own reference: the camera is destroyed by object, not by component
         RenderTexture? target;
         int layers;
         int bottom = Margin;                          // where the drawing starts, over the title block
@@ -259,7 +266,7 @@ internal static class DrawingSheet
                 {
                     used.Add(dp.gameObject.layer);
                     // Hide non-vehicle projectors so they don't bleed into the drawing.
-                    if (dp.enabled && !projectors.Any(p => p.Pointer == dp.Pointer))
+                    if (dp.enabled && !decalSeen.Contains(dp.Pointer))
                     {
                         dp.enabled = false;
                         hiddenEnvironmentProjectors.Add(dp);
@@ -312,7 +319,7 @@ internal static class DrawingSheet
             lightingCaptured = true;
             MeshTools.Fog(off: true);
             if (!fullbrightWas) MeshTools.ToggleFullbright();
-            var go = new GameObject("SprocketTools drawing camera");
+            var go = cameraObject = new GameObject("SprocketTools drawing camera");
             cam = go.AddComponent<Camera>();
             cam.CopyFrom(main);
             if (main.GetComponent<HDAdditionalCameraData>() is { } hd)
@@ -411,17 +418,24 @@ internal static class DrawingSheet
             armourProjectors.Clear();
         }
 
-        /// The frame the camera last drew into `from`, as the camera's own pixels.
+        /// The frame the camera last drew into `from`, as the camera's own pixels. The active target and the readback
+        /// texture go back whatever the read does: a failed grab must not leave the game drawing into ours.
         UnityEngine.Color32[] Read(int width, int height, RenderTexture? from)
         {
             var was = RenderTexture.active;
-            RenderTexture.active = from;
-            var picture = new Texture2D(width, height, TextureFormat.RGBA32, 1, false);
-            picture.ReadPixelsImpl(new Rect(0, 0, width, height), 0, 0, false);
-            RenderTexture.active = was;
-            var pixels = picture.GetPixels32();
-            UnityEngine.Object.Destroy(picture);
-            return pixels;
+            Texture2D? picture = null;
+            try
+            {
+                RenderTexture.active = from;
+                picture = new Texture2D(width, height, TextureFormat.RGBA32, 1, false);
+                picture.ReadPixelsImpl(new Rect(0, 0, width, height), 0, 0, false);
+                return picture.GetPixels32();
+            }
+            finally
+            {
+                Restore("active render target", () => RenderTexture.active = was);
+                Restore("readback texture", () => { if (picture != null) UnityEngine.Object.Destroy(picture); });
+            }
         }
 
         /// Whether a pixel is the backdrop: red and blue alike with green far below (the key, darker at the corners with
@@ -1263,10 +1277,11 @@ internal static class DrawingSheet
             hidden.Clear();
             foreach (var t in hiddenGround) Restore("terrain", () => { if (t != null) t.enabled = true; });
             hiddenGround.Clear();
-            Restore("drawing camera", () => { if (cam != null) { cam.targetTexture = null; UnityEngine.Object.Destroy(cam.gameObject); } });
+            Restore("drawing camera target", () => { if (cam != null) cam.targetTexture = null; });
+            Restore("drawing camera", () => { if (cameraObject != null) UnityEngine.Object.Destroy(cameraObject); });
             Restore("render target", () => { if (target != null) { target.Release(); UnityEngine.Object.Destroy(target); } });
             Restore("anti-aliasing target", () => { if (fine != null) { fine.Release(); UnityEngine.Object.Destroy(fine); } });
-            cam = null; target = null; hdData = null; fine = null;
+            cam = null; cameraObject = null; target = null; hdData = null; fine = null;
             if (lightingCaptured)
             {
                 Restore("fullbright", () => { if (!fullbrightWas && MeshTools.FullbrightOn) MeshTools.ToggleFullbright(); });

@@ -31,19 +31,35 @@ public sealed class DesignEditor : MonoBehaviour
     private static readonly List<object> alive = new(); // delegates handed to the game's undo history must not be collected
     private string editName = "", doneMessage = "", status = "";
     private string? recoveryJson, recoveryDir;
+    private IntPtr recoveryTarget;
     private bool restoring, ready, busy;
     private int waits;
     private float nextLookup, statusUntil;
     internal int LastEditedPart { get; private set; } = -1;
-    internal bool CanRestore => recoveryJson != null && !busy;
+    // A recovery belongs to the vehicle it was taken from: another vehicle loaded later must not inherit it by VUID.
+    private bool RecoveryBelongsHere => recoveryTarget != IntPtr.Zero && core?.Target?.Pointer == recoveryTarget;
+    internal bool CanRestore => recoveryJson != null && !busy && RecoveryBelongsHere;
+    internal bool IsReady => ready;
+    internal bool IsBusy => busy;
     internal VehicleDesignerCore? Core => core;
     public DesignEditor(IntPtr pointer) : base(pointer) { Instance = this; }
 
     internal void Say(string text, float seconds = 6) { status = text; statusUntil = Time.unscaledTime + seconds; }
 
+    /// Any of the three picture features re-hides armour and repaints materials while it takes its frames.
+    internal static bool IsCapturing => PhotoShot.Capturing || DrawingSheet.Capturing || Card.Capturing;
+
+    /// A capture hides armour and repaints materials, so no design edit may run while one is taking its frames.
+    internal bool CaptureBlocked()
+    {
+        if (!IsCapturing) return false;
+        Say("请先完成拍照或图纸，再修改载具。", 4);
+        return true;
+    }
+
     internal void RequestEdit(string name, string done, Func<string, EditResult> change)
     {
-        if (busy) return;
+        if (busy || CaptureBlocked()) return;
         Plugin.ModLog.LogInfo($"QOL requested: {name}");
         editName = name; doneMessage = done; edit = change;
         busy = true; Say(name + "……", 30);
@@ -54,7 +70,7 @@ public sealed class DesignEditor : MonoBehaviour
     /// design when it can't be (a changed part shares its mesh, or applying in place fails).
     internal void RequestLiveEdit(string name, string done, Func<string, AddonEdits.EditPlan> change)
     {
-        if (busy) return;
+        if (busy || CaptureBlocked()) return;
         Plugin.ModLog.LogInfo($"QOL requested: {name}");
         editName = name; doneMessage = done; liveEdit = change;
         busy = true; Say(name + "……", 30);
@@ -69,7 +85,7 @@ public sealed class DesignEditor : MonoBehaviour
     /// hull or turret, which can't be duplicated into an add-on), the planned design is loaded instead.
     internal void RequestSeparate(string name, string done, Func<string, (string Json, List<List<(int Source, int Added)>> Groups, string Log)> plan)
     {
-        if (busy) return;
+        if (busy || CaptureBlocked()) return;
         Plugin.ModLog.LogInfo($"QOL requested: {name}");
         editName = name; doneMessage = done; separate = plan;
         busy = true; Say(editName + "……", 30);
@@ -88,8 +104,7 @@ public sealed class DesignEditor : MonoBehaviour
         catch (Exception ex) { why = ex.Message; Plugin.ModLog.LogWarning($"TOOL_LIVE separate: {ex}"); }
         if (why == null) { busy = false; return; }
         Plugin.ModLog.LogInfo($"TOOL_LIVE separate not in place ({why}); loading the planned design instead");
-        recoveryJson = original;
-        LastEditedPart = groups[0][0].Added;
+        SetRecovery(original, groups[0][0].Added);
         restoring = false;
         doneMessage += "可用“恢复”撤销。";
         pending = core!.Load(serializer!.DeserializeJSON(planned), Il2CppSystem.Threading.CancellationToken.None);
@@ -217,21 +232,26 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     private readonly HashSet<int> filledRings = new();
+    private IntPtr lastMirrorTarget;
     private float nextTurretCheck;
+    private bool wasPlacing;
 
     /// A turret placed or copied with Mirror on gets a twin ring from the game with nothing on it (the game copies only
-    /// the ring): once the placing is done, the body, guns and everything else get mirrored onto it. Once per turret.
+    /// the ring): once the placing is done, the body, guns and everything else get mirrored onto it. Once per twin.
     private void FillMirroredTurrets()
     {
-        if (core?.Editor == null || core.Editor.OperationInProgress) return;
+        if (core?.Editor == null || core.Editor.OperationInProgress || IsCapturing) return;
         foreach (var part in AllParts())
         {
             if (part.GUID != Conversion.RingGuid || part.GetComponent<VehicleTransform>() is not { } ring) continue;
             var twin = ring.Mirror;
             if (twin == null) continue; // Unity's own null check: a twin just deleted counts as none
-            if (!Each(ring.Children).Any() || Each(twin.Children).Any() || !filledRings.Add((int)part.VUID)) continue;
+            // Keyed on the twin, not on the ring: one ring can gain several bare twins over the life of a design, and the
+            // second one used to be thought already handled. A twin that got its parts is recognised by having them.
+            if (twin.VehicleObject is not { } twinPart) continue;
+            if (!Each(ring.Children).Any() || Each(twin.Children).Any() || !filledRings.Add((int)twinPart.VUID)) continue;
             int vuid = (int)part.VUID;
-            Plugin.ModLog.LogInfo($"Turret mirror: twin ring {(int)(twin.VehicleObject?.VUID ?? default)} of ring {vuid} has nothing on it; mirroring the turret onto it");
+            Plugin.ModLog.LogInfo($"Turret mirror: twin ring {(int)twinPart.VUID} of ring {vuid} has nothing on it; mirroring the turret onto it");
             RequestEdit("正在镜像炮塔", "镜像炮塔已获得塔体及其上的全部内容。可用“恢复”撤销。", json =>
             {
                 var (result, count, how) = Conversion.MirrorTurret(json, vuid);
@@ -242,11 +262,42 @@ public sealed class DesignEditor : MonoBehaviour
         }
     }
 
+    private readonly HashSet<int> filledCopies = new();
+
+    /// A turret copied with Alt leaves a bare ring behind: the game duplicates only the ring it was given, and the copy
+    /// goes on naming the original's traverse motor and turret body, so the rebuild gives it no turret behaviour at all
+    /// and leaving the editor crashes in the game's own audio stage. Once the placing is done, everything that stands on
+    /// the original ring is copied onto it at the design level, each part with its own numbers, settings and shape.
+    private void FillCopiedTurrets()
+    {
+        if (core?.Editor == null || core.Editor.OperationInProgress || IsCapturing) return;
+        var rings = new List<(int Vuid, int Motor, int Parts, bool Mirrored)>();
+        foreach (var part in AllParts())
+        {
+            if (part.GUID != Conversion.RingGuid || part.GetComponent<VehicleTransform>() is not { } ring) continue;
+            if (part.GetComponent<Sprocket.Vehicles.Turrets.TurretRing>()?.Blueprint is not { } ids) continue;
+            rings.Add(((int)part.VUID, ids.TraverseMotorVUID, Each(ring.Children).Count(), ring.Mirror != null));
+        }
+        foreach (var copy in rings.Where(r => r.Parts == 0 && !r.Mirrored && !filledCopies.Contains(r.Vuid)))
+            foreach (var source in rings.Where(r => r.Vuid != copy.Vuid && r.Motor == copy.Motor && r.Parts > 0))
+            {
+                filledCopies.Add(copy.Vuid);
+                Plugin.ModLog.LogInfo($"Turret copy: ring {copy.Vuid} is a bare copy of ring {source.Vuid}; copying the turret onto it");
+                RequestEdit("正在复制炮塔", "复制的炮塔已获得塔体及其上的全部内容。可用“恢复”撤销。", json =>
+                {
+                    var (result, count, how) = Conversion.CopyTurret(json, source.Vuid, copy.Vuid);
+                    int body = Conversion.Objects(Conversion.Parse(result))[copy.Vuid]["structureID"]?.GetValue<int>() ?? copy.Vuid;
+                    return new EditResult(result, body, $"{how} of ring {source.Vuid}");
+                });
+                return;
+            }
+    }
+
     /// Ctrl+J, as in Blender: the selected add-ons join the last add-on, turret or hull selected (the active one).
     private void JoinHotkey()
     {
         var keys = UnityEngine.InputSystem.Keyboard.current;
-        if (keys == null || !keys.ctrlKey.isPressed || !keys.jKey.wasPressedThisFrame) return;
+        if (keys == null || !keys.ctrlKey.isPressed || !keys.jKey.wasPressedThisFrame || CaptureBlocked()) return;
         var picked = SelectedParts();
         var addons = SelectedParts(Conversion.AddonGuid);
         var bodies = SelectedParts(Conversion.CompartmentGuid);
@@ -259,7 +310,7 @@ public sealed class DesignEditor : MonoBehaviour
 
     internal void RequestRestore()
     {
-        if (busy || recoveryJson == null) return;
+        if (!CanRestore || CaptureBlocked()) return;
         busy = true; Say("正在恢复上次编辑之前的设计……", 30);
         queued = Restore;
     }
@@ -366,13 +417,32 @@ public sealed class DesignEditor : MonoBehaviour
                 nextLookup = Time.unscaledTime + 0.5f;
                 bool wasInEditor = core != null;
                 core = UnityEngine.Object.FindObjectOfType<VehicleDesignerCore>();
+                // A design load makes a new target: forget which rings were filled so one whose mirroring was refused
+                // (the twin still empty) can be tried again, while a finished one is skipped by the twin's own parts.
+                // A design load makes a new target: forget which twins were filled so one whose mirroring was refused
+                // (the twin still empty) can be tried again, while a finished one is skipped by the twin's own parts.
+                if ((core?.Target?.Pointer ?? IntPtr.Zero) != lastMirrorTarget) { lastMirrorTarget = core?.Target?.Pointer ?? IntPtr.Zero; wasPlacing = false; filledRings.Clear(); filledCopies.Clear(); }
                 if (wasInEditor && core == null) { MeshTools.LeftEditor(); ExplodedView.LeftEditor(); GearSpeeds.LeftEditor(); } // editor-only views end with it
             }
             ready = core != null && core.HasEditor && core.editorState == VehicleDesignerCore.EditorState.Running;
         });
         if (ready) Ui.Guard("Panel fit", PanelFit.Tick);
         if (ready && !busy) Ui.Guard("Ctrl+J", JoinHotkey);
-        if (ready && !busy && Time.unscaledTime >= nextTurretCheck) { nextTurretCheck = Time.unscaledTime + 0.5f; Ui.Guard("Turret mirror", FillMirroredTurrets); }
+        // A bare ring exists only once the game's own placing has finished, and the editor can be rebuilt before the next
+        // tick comes round, so also check on the very frame the placing ends.
+        bool placingJustEnded = false;
+        if (ready) Ui.Guard("Turret watch", () =>
+        {
+            bool placing = core?.Editor?.OperationInProgress ?? false;
+            placingJustEnded = (wasPlacing && !placing) || Time.unscaledTime >= nextTurretCheck;
+            wasPlacing = placing;
+            if (placingJustEnded) nextTurretCheck = Time.unscaledTime + 0.5f;
+        });
+        if (ready && !busy && placingJustEnded)
+        {
+            Ui.Guard("Turret mirror", FillMirroredTurrets);
+            if (!busy) Ui.Guard("Turret copy", FillCopiedTurrets);
+        }
         if (ready)
         {
             Ui.Guard("Mesh tools keys", MeshTools.Keys);
@@ -392,11 +462,14 @@ public sealed class DesignEditor : MonoBehaviour
                 var task = pending; pending = null; busy = false;
                 if (task.IsFaulted || task.IsCanceled)
                 {
-                    Say("游戏无法加载修改结果。您修改前的设计已备份；请使用“恢复”。", 10);
+                    Say(RecoveryBelongsHere ? "游戏无法加载修改结果。您修改前的设计已备份；请使用“恢复”。"
+                        : "游戏无法加载修改结果。请从 BepInEx\\SprocketToolsBackups 里载入 original.blueprint 找回修改前的设计。", 10);
                     Plugin.ModLog.LogError(task.Exception?.ToString() ?? "Vehicle load cancelled");
                 }
                 else
                 {
+                    // Our own reload makes a new Target, so re-point the recovery at it instead of letting another vehicle inherit it.
+                    recoveryTarget = core?.Target?.Pointer ?? IntPtr.Zero;
                     Say(restoring ? "已恢复设计。" : doneMessage, 8);
                     Plugin.ModLog.LogInfo(restoring ? "TOOL_RESTORE_OK" : $"TOOL_EDIT_OK: {editName}");
                     if (core?.Target != null && recoveryDir != null)
@@ -429,6 +502,7 @@ public sealed class DesignEditor : MonoBehaviour
     private bool EditorIdle(System.Action retry)
     {
         if (!ready || core == null) throw new Exception("请先在编辑器中打开一个载具。");
+        if (IsCapturing) { queued = retry; return false; }
         if (!core.DesignIOPossible || (core.Editor != null && core.Editor.OperationInProgress))
         {
             if (waits++ == 0) Plugin.ModLog.LogInfo($"WAIT editor busy: io={core.DesignIOPossible}, op={core.Editor?.OperationInProgress}");
@@ -448,6 +522,13 @@ public sealed class DesignEditor : MonoBehaviour
         File.WriteAllText(Path.Combine(recoveryDir, "edited.blueprint"), edited);
         File.WriteAllText(Path.Combine(recoveryDir, "README.txt"), $"{editName}。original.blueprint 是修改前的完整设计（含未保存的更改），edited.blueprint 是修改后的结果。将其中任意一个复制到阵营的 Blueprints\\Vehicles 文件夹即可载入。没有覆盖任何已保存的蓝图。");
         PruneBackups();
+    }
+
+    private void SetRecovery(string original, int focus)
+    {
+        recoveryJson = original;
+        recoveryTarget = core?.Target?.Pointer ?? IntPtr.Zero;
+        LastEditedPart = focus;
     }
 
     /// Only the newest backups are kept (setting "Backups kept"; 0 keeps all): each is a whole design or two, and they
@@ -474,8 +555,7 @@ public sealed class DesignEditor : MonoBehaviour
         var result = edit!(original);
         var nativeBlueprint = serializer!.DeserializeJSON(result.Json);
         Backup(original, result.Json);
-        recoveryJson = original;
-        LastEditedPart = result.FocusPart;
+        SetRecovery(original, result.FocusPart);
         restoring = false;
         Plugin.ModLog.LogInfo($"TOOL_EDIT {editName}: {result.Log}; backup={recoveryDir}");
         pending = core!.Load(nativeBlueprint, Il2CppSystem.Threading.CancellationToken.None);
@@ -493,8 +573,7 @@ public sealed class DesignEditor : MonoBehaviour
             try { ApplyInPlace(plan, original); busy = false; return; }
             catch (Exception ex) { Plugin.ModLog.LogWarning($"TOOL_LIVE couldn't apply in place, reloading the design instead: {ex}"); }
         }
-        recoveryJson = original;
-        LastEditedPart = plan.Focus;
+        SetRecovery(original, plan.Focus);
         restoring = false;
         pending = core!.Load(serializer!.DeserializeJSON(plan.DesignJson), Il2CppSystem.Threading.CancellationToken.None);
     }
@@ -656,7 +735,8 @@ public sealed class DesignEditor : MonoBehaviour
 
     private void Restore()
     {
-        if (recoveryJson == null || core == null || !core.DesignIOPossible) throw new Exception("没有可恢复的记录，或编辑器正忙。");
+        if (IsCapturing) { queued = Restore; return; }
+        if (recoveryJson == null || !RecoveryBelongsHere || core == null || !core.DesignIOPossible) throw new Exception("当前载具没有可恢复的记录（或已切换载具），或编辑器正忙。");
         // Keep any work done after the edit before replacing it.
         File.WriteAllText(Path.Combine(recoveryDir!, "before-restore-" + DateTime.Now.ToString("HHmmssfff") + ".blueprint"), Snapshot());
         restoring = true;

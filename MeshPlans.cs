@@ -27,22 +27,37 @@ public static class MeshPlans
     /// false skips the last, for tools asked to leave points unjoined. Faces that were squashed already are left be.
     public static string? Check(IReadOnlyList<Vector3> pos, IReadOnlyList<int[]> faces, Rebuild plan, bool gaps = true)
     {
+        if (plan.Why != null) return plan.Why;
+        if (pos.Any(p => !Finite(p)) || faces.Any(f => f.Length < 3 || f.Any(v => v < 0 || v >= pos.Count)))
+            return "原始网格含有无效的顶点或面";
+        if (plan.Remove.Any(f => f < 0 || f >= faces.Count) || plan.Add.Any(f => f.Source < 0 || f.Source >= faces.Count))
+            return "所选的面已不在当前网格上，请重新选择";
+        if (plan.Points.Any(p => !Finite(p.P) || p.Blend.Length == 0 || p.Blend.Any(b => b.V < 0 || b.V >= pos.Count || !float.IsFinite(b.W) || b.W < 0)
+                || !float.IsFinite(p.Blend.Sum(b => b.W)) || p.Blend.Sum(b => b.W) <= 0))
+            return "新顶点或它的厚度权重无效";
         var at = pos.Concat(plan.Points.Select(p => p.P)).ToList();
         foreach (var nf in plan.Add)
         {
             var c = nf.Corners;
             if (c.Length < 3 || c.Distinct().Count() != c.Length || c.Any(i => i < 0 || i >= at.Count)) return "新面会重复使用同一个角点";
-            var n = HoleRing.Normal(c.Select(i => at[i]).ToList());
-            var s = HoleRing.Normal(faces[nf.Source].Select(i => pos[i]).ToList());
+            var n = Newell(at, c);
+            var s = Newell(pos, faces[nf.Source]);
+            if (!Finite(n) || !Finite(s) || !float.IsFinite(n.Length()) || !float.IsFinite(s.Length())) return "面的面积数值无效";
             if (s.Length() < 1e-9f) continue; // made from a squashed face: nothing to compare with
             if (n.Length() < 1e-5f * s.Length()) return "新面会被压成几乎零面积";
             if (Vector3.Dot(n, s) < -0.5f * n.Length() * s.Length()) return "新面会被翻转";
         }
         var removed = plan.Remove.ToHashSet();
         var after = faces.Where((_, i) => !removed.Contains(i)).Concat(plan.Add.Select(a => a.Corners)).ToList();
-        float tolerance = 1e-5f + 1e-4f * plan.Remove.SelectMany(f => faces[f]).Select(i => pos[i]).DefaultIfEmpty().Max(p => p.Length());
-        if (Length(after, at, u => u > 2) > Length(faces, at, u => u > 2) + tolerance) return "面会互相叠覆";
-        if (gaps && Length(after, at, u => u == 1) > Length(faces, at, u => u == 1) + tolerance) return "会留下裂缝（面不再相连）";
+        // Tolerance follows the size of the patch being edited, not its distance from the world origin.
+        var touched = plan.Remove.Concat(plan.Add.Select(f => f.Source)).Distinct().SelectMany(f => faces[f]).Distinct().Select(v => pos[v]).ToList();
+        float extent = touched.Count == 0 ? 0 : Vector3.Distance(touched.Aggregate(Vector3.Min), touched.Aggregate(Vector3.Max));
+        float tolerance = 1e-5f + 1e-4f * extent;
+        var beforeLengths = EdgeLengths(faces, at);
+        var afterLengths = EdgeLengths(after, at);
+        if (afterLengths.Crowded > beforeLengths.Crowded + tolerance) return "面会互相叠覆";
+        if (afterLengths.SameWay > beforeLengths.SameWay + tolerance) return "相连的面沿共用边朝同一个方向绕行";
+        if (gaps && afterLengths.Open > beforeLengths.Open + tolerance) return "会留下裂缝（面不再相连）";
         return null;
     }
 
@@ -52,8 +67,13 @@ public static class MeshPlans
         foreach (var f in faces)
         {
             if (!f.Any(moved.ContainsKey)) continue;
-            var was = HoleRing.Normal(f.Select(i => pos[i]).ToList());
-            var now = HoleRing.Normal(f.Select(i => moved.TryGetValue(i, out var p) ? p : pos[i]).ToList());
+            if (f.Any(v => v < 0 || v >= pos.Count || !Finite(moved.TryGetValue(v, out var to) ? to : pos[v]))) return "要移动到的顶点位置无效";
+            var was = Newell(pos, f);
+            // Fan the triangles from one corner of the face: absolute-coordinate products lose a small face far from the origin.
+            var origin = moved.TryGetValue(f[0], out var first) ? first : pos[f[0]];
+            var now = Vector3.Zero;
+            for (int k = 1; k + 1 < f.Length; k++) now += Vector3.Cross((moved.TryGetValue(f[k], out var a) ? a : pos[f[k]]) - origin,
+                (moved.TryGetValue(f[k + 1], out var b) ? b : pos[f[k + 1]]) - origin);
             if (was.Length() < 1e-8f) continue; // squashed already: not this tool's doing
             if (now.Length() < 1e-8f) return "某个面会被压成零面积";
             if (Vector3.Dot(now, was) <= 0) return "某个面会翻折";
@@ -98,16 +118,29 @@ public static class MeshPlans
 
     static IEnumerable<(int, int)> Sides(int[] f) => f.Select((v, k) => v < f[(k + 1) % f.Length] ? (v, f[(k + 1) % f.Length]) : (f[(k + 1) % f.Length], v));
 
-    static Dictionary<(int, int), int> Uses(IEnumerable<int[]> faces)
+    // Total length of the edges whose use the rebuild changes: crowded (over two faces, so faces laid over each other),
+    // open (one face, so a crack), and same-way (two faces running the same way along it, so they fold on each other).
+    static (double Crowded, double Open, double SameWay) EdgeLengths(IEnumerable<int[]> faces, IReadOnlyList<Vector3> at)
     {
-        var uses = new Dictionary<(int, int), int>();
-        foreach (var f in faces) foreach (var e in Sides(f)) uses[e] = uses.GetValueOrDefault(e) + 1;
-        return uses;
+        var uses = new Dictionary<(int, int), (int Count, int Turn)>();
+        foreach (var f in faces)
+            for (int k = 0; k < f.Length; k++)
+            {
+                int a = f[k], b = f[(k + 1) % f.Length];
+                var e = Key(a, b);
+                var old = uses.GetValueOrDefault(e);
+                uses[e] = (old.Count + 1, old.Turn + (a < b ? 1 : -1));
+            }
+        double crowded = 0, open = 0, sameWay = 0;
+        foreach (var (edge, use) in uses)
+        {
+            double length = Vector3.Distance(at[edge.Item1], at[edge.Item2]);
+            if (use.Count > 2) crowded += length;
+            if (use.Count == 1) open += length;
+            if (use.Count == 2 && use.Turn != 0) sameWay += length;
+        }
+        return (crowded, open, sameWay);
     }
-
-    /// Total length of the edges used by a number of faces `which` picks (1: open edges; more than 2: crowded ones).
-    static double Length(IEnumerable<int[]> faces, IReadOnlyList<Vector3> at, Func<int, bool> which) =>
-        Uses(faces).Where(u => which(u.Value)).Sum(u => (double)Vector3.Distance(at[u.Key.Item1], at[u.Key.Item2]));
 
     // ---------- Flatten ----------
 
@@ -998,9 +1031,14 @@ public static class MeshPlans
     static Vector3 Newell(IReadOnlyList<Vector3> pos, IReadOnlyList<int> loop)
     {
         var n = Vector3.Zero;
-        for (int k = 0; k < loop.Count; k++) n += Vector3.Cross(pos[loop[k]], pos[loop[(k + 1) % loop.Count]]);
+        if (loop.Count < 3) return n;
+        // Fanned from the loop's own corner: products of absolute coordinates lose the normal of a small face far from the origin.
+        var origin = pos[loop[0]];
+        for (int k = 1; k + 1 < loop.Count; k++) n += Vector3.Cross(pos[loop[k]] - origin, pos[loop[k + 1]] - origin);
         return n;
     }
+
+    static bool Finite(Vector3 p) => float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
 
     static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
 }

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using HarmonyLib;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Sprocket;
 using Sprocket.Blueprints;
 using Sprocket.Factions;
@@ -24,6 +25,102 @@ public static class PartPaint
     static bool themesLogged;
 
     static IEditableVehicleMaterialPainter Jobs(VehicleMaterialPainter p) => p.Cast<IEditableVehicleMaterialPainter>();
+
+    // Native load replaces every non-primary saved paint with defaults when the saved slot count differs from
+    // the default count. The synchronous factory receives a matching array for this one saved vehicle, keeping
+    // its registered paints, colours and ownership lists. Restore the factory's defaults even when creation fails.
+    // Hooking the factory also avoids detouring an IL2CPP constructor's object-allocation wrapper.
+    [HarmonyPatch(typeof(PaintMain), nameof(PaintMain.Create))]
+    internal static class SavedPaintLoad
+    {
+        sealed class LoadState
+        {
+            public readonly Il2CppReferenceArray<PaintJob> Original, Canonical;
+            public Il2CppReferenceArray<PaintJob> Replacement;
+            public readonly LoadState? Parent;
+            public LoadState(Il2CppReferenceArray<PaintJob> original, Il2CppReferenceArray<PaintJob> canonical,
+                             Il2CppReferenceArray<PaintJob> replacement, LoadState? parent) =>
+                (Original, Canonical, Replacement, Parent) = (original, canonical, replacement, parent);
+        }
+        static readonly Dictionary<IntPtr, LoadState> activeLoads = new();
+
+        [HarmonyPrefix]
+        static void Before(PaintMain __instance, IVehicleGateway vehicle, out LoadState? __state)
+        {
+            LoadState? state = null;
+            Ui.Guard("Load part paint", () =>
+            {
+                ownerCache.Clear(); // materials can be processed again within the same frame as a reload
+                var current = __instance.defaultPaintJobs;
+                if (current == null) return;
+                activeLoads.TryGetValue(__instance.Pointer, out var parent);
+                var defaults = parent?.Canonical ?? current;
+                // A nested load can be for a different design or a new vehicle. It must not inherit the enclosing
+                // vehicle's extended slot count; normalize against the actual factory defaults every time.
+                if (parent != null)
+                {
+                    state = new LoadState(current, defaults, defaults, parent);
+                    activeLoads[__instance.Pointer] = state;
+                    __instance.defaultPaintJobs = defaults;
+                }
+                var reader = vehicle.BlueprintReader;
+                if (!reader.TryGet<VehiclePaintJobsBlueprint>(out VehiclePaintJobsBlueprint savedPaints)) return;
+                var ids = savedPaints?.PaintJobIDs;
+                if (defaults == null || ids == null || ids.Length <= defaults.Length || ids.Length > Last + 1) return;
+                bool hasOwnPaint = false;
+                for (int slot = First; slot < ids.Length && !hasOwnPaint; slot++)
+                    if (ids[slot] >= 0 && reader.TryGet<PaintJob>(ids[slot], out PaintJob saved))
+                        hasOwnPaint = saved?.Description?.StartsWith(Tag, StringComparison.Ordinal) == true;
+                var original = defaults.ToArray();
+                var normalized = PartPaintPersistence.NormalizeDefaults(original, ids.Length, First, Last, hasOwnPaint);
+                if (normalized == null || ReferenceEquals(normalized, original)) return;
+                var replacement = new Il2CppReferenceArray<PaintJob>(normalized);
+                state ??= new LoadState(current, defaults, replacement, parent);
+                state.Replacement = replacement;
+                activeLoads[__instance.Pointer] = state;
+                __instance.defaultPaintJobs = state.Replacement;
+                Plugin.ModLog.LogInfo($"Own paint: preserving {ids.Length} saved paint slots (native defaults: {defaults.Length})");
+            });
+            __state = state;
+        }
+
+        [HarmonyPostfix]
+        static void After(IVehicleMaterialProcessor __result) => Ui.Guard("Load part paint", () =>
+        {
+            if (__result?.TryCast<VehicleMaterialPainter>() is not { } painter) return;
+            ownerCache.Remove(painter.Pointer);
+            Seen(painter);
+        });
+
+        [HarmonyFinalizer]
+        static Exception? Restore(PaintMain __instance, LoadState? __state, Exception? __exception)
+        {
+            if (__state != null) Ui.Guard("Restore paint defaults", () =>
+            {
+                try
+                {
+                    if (__instance.defaultPaintJobs?.Pointer == __state.Replacement.Pointer)
+                        __instance.defaultPaintJobs = __state.Original;
+                }
+                finally
+                {
+                    if (activeLoads.TryGetValue(__instance.Pointer, out var current) && ReferenceEquals(current, __state))
+                    {
+                        if (__state.Parent == null) activeLoads.Remove(__instance.Pointer);
+                        else activeLoads[__instance.Pointer] = __state.Parent;
+                    }
+                }
+            });
+            return __exception;
+        }
+    }
+
+    [HarmonyPrefix, HarmonyPatch(typeof(VehicleMaterialPainter), nameof(VehicleMaterialPainter.Release))]
+    static void Released(VehicleMaterialPainter __instance)
+    {
+        ownerCache.Remove(__instance.Pointer);
+        painters.RemoveAll(p => p.Pointer == __instance.Pointer);
+    }
 
     // Every vehicle's painter seen lately, newest first. A design loaded or rebuilt gets a new one, and previews have
     // their own, so a part's painter is looked up each time: the one whose materials include the part's.
@@ -88,19 +185,16 @@ public static class PartPaint
     });
 
     // The game paints every material in turn (thousands on loading): the part lists are read once a frame, not each time.
-    static IntPtr ownersFor;
-    static int ownersFrame = -1;
-    static Dictionary<int, int> ownersNow = new();
+    static readonly Dictionary<IntPtr, (int Frame, Dictionary<int, int> Owners)> ownerCache = new();
 
     static Dictionary<int, int> OwnersNow(VehicleMaterialPainter p)
     {
-        if (p.Pointer != ownersFor || UnityEngine.Time.frameCount != ownersFrame)
-        {
-            ownersNow = Owners(p);
-            ownersFor = p.Pointer;
-            ownersFrame = UnityEngine.Time.frameCount;
-        }
-        return ownersNow;
+        int frame = UnityEngine.Time.frameCount;
+        if (ownerCache.TryGetValue(p.Pointer, out var cached) && cached.Frame == frame) return cached.Owners;
+        if (ownerCache.Count >= 12 && !ownerCache.ContainsKey(p.Pointer)) ownerCache.Clear();
+        var owners = Owners(p);
+        ownerCache[p.Pointer] = (frame, owners);
+        return owners;
     }
 
     [HarmonyPostfix, HarmonyPatch(typeof(PlateStructureEditor), nameof(PlateStructureEditor.OnGUI))]
@@ -249,10 +343,16 @@ public static class PartPaint
         // The lists of parts, one per own paint.
         var owners = Owners(p);
         foreach (var (v, slot) in slots) { if (slot == 0) owners.Remove(v); else owners[v] = slot; }
+        var changed = new HashSet<int>(slots.Values.Where(s => s != 0));
         for (int s = First; s < Math.Min(jobs.PaintJobCount, Last + 1); s++)
             if (jobs.GetPaintJob(s) is { } j && (j.Description ?? "").StartsWith(Tag))
-                j.Description = Tag + " " + string.Join(" ", owners.Where(o => o.Value == s).Select(o => o.Key).OrderBy(v => v));
-        ownersFrame = -1; // the lists changed: read them again
+            {
+                string description = Tag + " " + string.Join(" ", owners.Where(o => o.Value == s).Select(o => o.Key).OrderBy(v => v));
+                if (j.Description == description) continue;
+                j.Description = description;
+                changed.Add(s); // removals matter too, including a reset to vehicle paint
+            }
+        ownerCache.Remove(p.Pointer); // the lists changed: read them again
         // The parts' outside materials to their slots.
         int moved = 0;
         foreach (var part in DesignEditor.Instance!.AllParts().Where(o => slots.ContainsKey((int)o.VUID)))
@@ -270,7 +370,7 @@ public static class PartPaint
                 moved++;
             }
         }
-        foreach (int slot in slots.Values.Where(s => s != 0).Distinct()) Repaint(p, slot);
+        foreach (int slot in changed) Repaint(p, slot);
         Hotkeys.Current?.RequestRedraw();
         var check = Owners(p);
         Plugin.ModLog.LogInfo($"Own paint: {string.Join(", ", slots.Select(s => $"{s.Key} -> {(s.Value == 0 ? "vehicle" : Name(s.Value))}"))}, {moved} materials; " +
@@ -297,30 +397,40 @@ public static class PartPaint
             var tags = PaintJobDesigner.PaintThemeTags;
             Plugin.ModLog.LogInfo($"Own paint: Paint tab themes [{(names == null ? "" : string.Join(", ", names))}], tags [{(tags == null ? "" : string.Join(", ", tags))}]");
         }
-        // A new slot has no paint job in it yet: make one, registered with the design (so it's saved), and note its
-        // number in the design's list of paint jobs.
-        if (slot != 0 && jobs.GetPaintJob(slot) == null && p.GetPaintJob(slot) is { } loader)
+        // SetPaintJobCount can already create the default job. Both existing and freshly created references must
+        // appear in the register; otherwise the live paint can be absent from the saved design's slot list.
+        if (slot != 0 && p.GetPaintJob(slot) is { } loader && !loader.PaintJobReference.HasBlueprint)
         {
             var made = loader.PaintJobReference.EnsureReference();
-            var register = p.blueprint.Blueprint;
-            var ids = Enumerable.Range(0, jobs.PaintJobCount).Select(i => p.GetPaintJob(i) is { } l && l.PaintJobReference.HasBlueprint ? l.PaintJobReference.BlueprintID : -1).ToArray();
-            string was = string.Join(",", register.PaintJobIDs ?? new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<int>(0));
-            register.PaintJobIDs = ids;
-            p.blueprint.NotifyModified();
-            Plugin.ModLog.LogInfo($"Own paint: made a paint job for slot {slot} ({(made == null ? "none" : "id " + loader.PaintJobReference.BlueprintID)}); paint job list [{was}] -> [{string.Join(",", ids)}]");
+            Plugin.ModLog.LogInfo($"Own paint: made a paint job for slot {slot} ({(made == null ? "none" : "id " + loader.PaintJobReference.BlueprintID)})");
         }
+        SyncPaintJobIDs(p);
         if (slot != 0 && jobs.GetPaintJob(slot) is { } job && !(job.Description ?? "").StartsWith(Tag))
         {
             // A new own paint: named, and looking like the Primary paint until it's changed.
             var primary = jobs.GetPaintJob(0);
             job.Name = Name(slot);
             job.Description = Tag;
-            ownersFrame = -1;
+            ownerCache.Clear();
             job.ColourMapUri = primary.ColourMapUri;
             job.Scale = primary.Scale; job.Roughness = primary.Roughness; job.Metallic = primary.Metallic;
             job.TintR = primary.TintR; job.TintG = primary.TintG; job.TintB = primary.TintB;
             job.Saturation = primary.Saturation; job.Condition = primary.Condition; job.Grime = primary.Grime;
+            p.GetPaintJob(slot)?.PaintJobReference.MarkModified();
         }
+    }
+
+    static void SyncPaintJobIDs(VehicleMaterialPainter p)
+    {
+        var register = p.blueprint.Blueprint;
+        var ids = Enumerable.Range(0, Jobs(p).PaintJobCount)
+            .Select(i => p.GetPaintJob(i) is { } loader && loader.PaintJobReference.HasBlueprint ? loader.PaintJobReference.BlueprintID : -1).ToArray();
+        var previous = register.PaintJobIDs;
+        if (previous != null && previous.SequenceEqual(ids)) return;
+        string was = previous == null ? "" : string.Join(",", previous);
+        register.PaintJobIDs = ids;
+        p.blueprint.NotifyModified();
+        Plugin.ModLog.LogInfo($"Own paint: paint job list [{was}] -> [{string.Join(",", ids)}]");
     }
 }
 

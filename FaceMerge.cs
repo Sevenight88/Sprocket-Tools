@@ -48,6 +48,10 @@ public static class FaceMerge
     /// `loose`: edges no face uses (their points stay).
     public static List<Group> Plan(IReadOnlyList<Vector3> pos, IReadOnlyList<int[]> faces, ISet<int> selected, ISet<(int, int)> loose, SidePoints sides)
     {
+        if (selected.Count == 0) return new();
+        if (selected.Any(f => f < 0 || f >= faces.Count) || pos.Any(p => !float.IsFinite(p.X) || !float.IsFinite(p.Y) || !float.IsFinite(p.Z)) ||
+            faces.Any(f => f.Length < 3 || f.Distinct().Count() != f.Length || f.Any(v => v < 0 || v >= pos.Count)))
+            return new() { new Group(selected.ToList(), new(), new(), new(), new(), "所选范围或网格含有无效的顶点或面") };
         var chosen = new HashSet<int>(selected);
         var lines = new HashSet<(int, int)>(); // edges of a line being taken out: faces across them may join
         var edgeFaces = new Dictionary<(int, int), List<int>>();
@@ -240,7 +244,10 @@ public static class FaceMerge
     static Vector3 Newell(IReadOnlyList<Vector3> pos, IReadOnlyList<int> loop)
     {
         var n = Vector3.Zero;
-        for (int k = 0; k < loop.Count; k++) n += Vector3.Cross(pos[loop[k]], pos[loop[(k + 1) % loop.Count]]);
+        if (loop.Count < 3) return n;
+        // Fanned from the loop's own corner: products of absolute coordinates lose a small face far from the origin.
+        var origin = pos[loop[0]];
+        for (int k = 1; k + 1 < loop.Count; k++) n += Vector3.Cross(pos[loop[k]] - origin, pos[loop[k + 1]] - origin);
         return n;
     }
 

@@ -181,11 +181,13 @@ public static class HoleQuality
     /// The game's own consistency checks for a face and its corners, plus "every corner's edge joins it to the next".
     internal static string? Problem(Face face)
     {
-        if ((int)Face.Validate(face) != 0) return "face: " + Face.Validate(face);
+        var faceProblem = Face.Validate(face);
+        if ((int)faceProblem != 0) return "face: " + faceProblem;
         var l = face.firstLoop;
         for (int i = 0; i < face.vertexCount; i++, l = l.next)
         {
-            if ((int)Loop.Validate(l) != 0) return "corner: " + Loop.Validate(l);
+            var loopProblem = Loop.Validate(l);
+            if ((int)loopProblem != 0) return "corner: " + loopProblem;
             if (!Loop.ValidateRadialCycle(l)) return "corner not linked to its edge";
             if (!l.edge.ContainsVertices(l.vertex, l.next.vertex)) return "corner edge doesn't join it to the next corner";
         }

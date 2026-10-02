@@ -486,21 +486,37 @@ internal static class Drawing
     [DllImport("user32", CharSet = CharSet.Unicode)] static extern int DrawTextW(IntPtr dc, string text, int length, ref Rect rect, uint format);
 
     /// An RGB picture (three bytes a pixel, rows from the bottom) as a PNG file; with rgba set, an RGBA picture (four
-    /// bytes a pixel, alpha 0 for the parts to see through).
+    /// bytes a pixel, alpha 0 for the parts to see through). Written beside the destination and moved over it, so a
+    /// failed write leaves the picture that was there before rather than a half-file.
     internal static void SavePng(string path, int w, int h, byte[] rgb, bool rgba = false)
     {
+        ArgumentNullException.ThrowIfNull(rgb);
         int step = rgba ? 4 : 3;
-        using var file = File.Create(path);
-        file.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
-        var head = new byte[13];
-        BigEndian(head, 0, w); BigEndian(head, 4, h);
-        head[8] = 8; head[9] = (byte)(rgba ? 6 : 2); // 8 bits, RGB or RGBA
-        Chunk(file, "IHDR", head);
-        var packed = new MemoryStream();
-        using (var z = new ZLibStream(packed, CompressionLevel.Fastest, leaveOpen: true))
-            for (int y = h - 1; y >= 0; y--) { z.WriteByte(0); z.Write(rgb, y * w * step, w * step); } // PNG rows go from the top
-        Chunk(file, "IDAT", packed.ToArray());
-        Chunk(file, "IEND", Array.Empty<byte>());
+        if (w <= 0 || h <= 0 || (long)w * h * step != rgb.Length)
+            throw new ArgumentException("图片尺寸与数据不符。");
+        string destination = Path.GetFullPath(path);
+        string temporary = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                file.Write(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 });
+                var head = new byte[13];
+                BigEndian(head, 0, w); BigEndian(head, 4, h);
+                head[8] = 8; head[9] = (byte)(rgba ? 6 : 2); // 8 bits, RGB or RGBA
+                Chunk(file, "IHDR", head);
+                using var packed = new MemoryStream();
+                using (var z = new ZLibStream(packed, CompressionLevel.Fastest, leaveOpen: true))
+                    for (int y = h - 1; y >= 0; y--) { z.WriteByte(0); z.Write(rgb, y * w * step, w * step); } // PNG rows go from the top
+                Chunk(file, "IDAT", packed.ToArray());
+                Chunk(file, "IEND", Array.Empty<byte>());
+            }
+            File.Move(temporary, destination, overwrite: true);
+        }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+        }
     }
 
     static void Chunk(Stream s, string type, byte[] data)

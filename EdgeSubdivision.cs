@@ -9,6 +9,10 @@ public static class EdgeSubdivision
         IEnumerable<(int A,int B)> selected, int sections, ISet<int>? faceScope = null)
     {
         if (sections < 2 || sections > 16) return MeshPlans.Rebuild.Fail("分割段数请在 2 到 16 之间");
+        // Checked before the edge tally below, which indexes the mesh by these very numbers.
+        if (pos.Any(p => !float.IsFinite(p.X) || !float.IsFinite(p.Y) || !float.IsFinite(p.Z)) ||
+            faces.Any(f => f.Length < 3 || f.Distinct().Count() != f.Length || f.Any(v => v < 0 || v >= pos.Count)))
+            return MeshPlans.Rebuild.Fail("网格含有无效的顶点或面");
         if (faceScope != null && (faceScope.Count == 0 || faceScope.Any(f => f < 0 || f >= faces.Count)))
             return MeshPlans.Rebuild.Fail("请先选择面");
         var uses = new Dictionary<(int,int),List<int>>();
@@ -22,6 +26,8 @@ public static class EdgeSubdivision
         var edges=selected.Select(e=>FaceMerge.Key(e.A,e.B)).ToHashSet();
         if (edges.Count==0) return MeshPlans.Rebuild.Fail("请先选择边");
         if (edges.Any(e=>!uses.ContainsKey(e))) return MeshPlans.Rebuild.Fail("所选边须属于某个面");
+        if (faceScope != null && edges.Any(e => !uses[e].Any(faceScope.Contains)))
+            return MeshPlans.Rebuild.Fail("所选的边不属于所选的面，请重新选择");
         var pending=new Queue<(int,int)>(edges);
         while (pending.TryDequeue(out var edge))
         {

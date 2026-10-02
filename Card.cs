@@ -12,6 +12,9 @@ namespace SprocketTools;
 internal static class Card
 {
     static bool busy;
+
+    /// True while F10's card is being taken.
+    internal static bool Capturing => busy;
     const int FirstSettle = 40; // frames: the exposure settles first, then the anti-aliasing fills this frame
 
     /// F10: take the card. Angle, side, focal length, framing, canvas size and backdrop come from the config.
@@ -20,8 +23,11 @@ internal static class Card
     {
         if (busy || PhotoShot.Capturing || DesignEditor.Instance is not { } editor || Keyboard.current is not { } keys || MeshTools.Typing()) return;
         if (!keys.f10Key.wasPressedThisFrame) return;
+        if (DrawingSheet.Capturing) return;
         busy = true;
-        editor.StartCoroutine(Run().WrapToIl2Cpp());
+        // A coroutine that never started must not leave busy true for the rest of the session.
+        try { editor.StartCoroutine(Run().WrapToIl2Cpp()); }
+        catch { busy = false; throw; }
     }
 
     static System.Collections.IEnumerator Run()

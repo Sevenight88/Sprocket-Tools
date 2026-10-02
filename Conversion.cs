@@ -99,8 +99,83 @@ public static class Conversion
     }
 
     /// A part's own numbers (its components: "cannon", "turretRing", ...), keyed by name; not links to other parts or settings.
-    static IEnumerable<string> ComponentKeys(JsonObject o) => o.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && char.IsLetter(kv.Key[0])
-        && kv.Key is not ("vuid" or "pvuid" or "flags" or "structureID") && !kv.Key.EndsWith("Vuid") && !kv.Key.EndsWith("ID")).Select(kv => kv.Key).ToList();
+    internal static IEnumerable<string> ComponentKeys(JsonObject o) => o.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && char.IsLetter(kv.Key[0])
+        && kv.Key is not ("vuid" or "pvuid" or "flags" or "structureID") && !NamesBlock(kv.Key) && !kv.Key.EndsWith("Vuid") && !kv.Key.EndsWith("ID")).Select(kv => kv.Key).ToList();
+
+    // Settings blocks name other parts by their component numbers. Only these fields do; every other integer in a block
+    // is a setting, and settings numbers collide with component numbers by design (ringThickness 5, ratio 50, priority 5).
+    internal static readonly string[] PartNumbers = { "motorVuid", "sightVuid", "linkedCannonVuid" };
+    internal static readonly string[] PartNumberLists = { "operatedBehaviours", "barrelVuids" };
+
+    /// Which of a part's own numbers name a settings block rather than a part. Named by field, never by value: block ids,
+    /// component numbers and part numbers are three ranges that overlap freely. Measured over the community blueprints:
+    /// every `traverseConstraintsVuid` (a traverse motor's limits) is a block id, while it looks exactly like a part link.
+    /// `powertrainSteeringControls` appears once per design (the driver's compartment) and every time names a block.
+    internal static bool NamesBlock(string key) => key.EndsWith("BlueprintVuid") || key.EndsWith("ConstraintsVuid") || key == "powertrainSteeringControls";
+
+    /// A part also names other parts from inside its own nested settings: a mantlet's `mantletBlueprint` dictionary holds
+    /// its laying drive and trunnions (component numbers of parts next to it) and sometimes its shield (a part number).
+    /// Both go through the same map, so the copy needs no knowing which of the two it was — only that it is a link.
+    /// `mirrorVuid` and `structureVuid` are links too but must be able to stay behind, so the mirror/turret body paths
+    /// handle them on their own.
+    static bool NamesNestedPart(string key) => !NamesBlock(key) && key is not ("vuid" or "pvuid" or "mirrorVuid" or "structureVuid")
+        && key.EndsWith("Vuid", StringComparison.OrdinalIgnoreCase);
+
+    static IEnumerable<(string Field, int At)> NestedLinksOf(JsonObject part)
+    {
+        foreach (var (name, value) in part)
+            if (value is JsonObject nested)
+                foreach (var (key, at) in nested)
+                {
+                    if (!NamesNestedPart(key)) continue;
+                    if (at is JsonValue one && one.TryGetValue<int>(out int number) && number > 0) yield return ($"{name}.{key}", number);
+                    if (at is JsonArray list) foreach (var item in list) if (item is JsonValue each && each.TryGetValue<int>(out int member) && member > 0) yield return ($"{name}.{key}[]", member);
+                }
+    }
+
+    internal static void RemapNestedLinks(JsonObject part, Func<int, int> resolve)
+    {
+        foreach (var value in part.Select(kv => kv.Value).OfType<JsonObject>())
+            foreach (var (key, at) in value.ToList())
+            {
+                if (!NamesNestedPart(key)) continue;
+                if (at is JsonValue one && one.TryGetValue<int>(out int number) && number > 0) value[key] = resolve(number);
+                if (at is JsonArray list)
+                    for (int i = 0; i < list.Count; i++) if (list[i] is JsonValue item && item.TryGetValue<int>(out int member) && member > 0) list[i] = resolve(member);
+            }
+    }
+    static bool NamesParts(JsonObject settings) => NamedParts(settings).Any();
+    internal static IEnumerable<int> NamedParts(JsonObject settings)
+    {
+        foreach (var name in PartNumbers) if (settings[name] is JsonValue one && one.TryGetValue<int>(out int at) && at > 0) yield return at;
+        foreach (var name in PartNumberLists) if (settings[name] is JsonArray list) foreach (var x in list) if (x is JsonValue iv && iv.TryGetValue<int>(out int at) && at > 0) yield return at;
+    }
+
+    internal static void RemapNamedParts(JsonObject settings, IReadOnlyDictionary<int, int> map)
+    {
+        foreach (var name in PartNumbers)
+            if (settings[name] is JsonValue one && one.TryGetValue<int>(out int at) && map.TryGetValue(at, out int to)) settings[name] = to;
+        foreach (var name in PartNumberLists)
+            if (settings[name] is JsonArray list)
+                for (int i = 0; i < list.Count; i++) if (list[i] is JsonValue iv && iv.TryGetValue<int>(out int at) && map.TryGetValue(at, out int to)) list[i] = to;
+    }
+
+    static Dictionary<int, List<int>> ChildrenByParent(Dictionary<int, JsonObject> objects) =>
+        objects.Values.GroupBy(o => Id(o, "pvuid")).ToDictionary(g => g.Key, g => g.Select(o => Id(o, "vuid")).ToList());
+
+    /// Every part hanging under `top` (the top itself excluded), nearest first.
+    static List<int> Below(Dictionary<int, List<int>> children, int top)
+    {
+        var found = new List<int>();
+        for (var queue = new Queue<int>(new[] { top }); queue.Count > 0;)
+            foreach (int c in children.GetValueOrDefault(queue.Dequeue()) ?? new()) { found.Add(c); queue.Enqueue(c); }
+        return found;
+    }
+
+    /// Above every number a part or one of its components already uses: the next free one for copies.
+    internal static int HighestNumber(Dictionary<int, JsonObject> objects) =>
+        objects.Values.SelectMany(o => o.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && kv.Key is not ("pvuid" or "flags"))
+                                       .Select(kv => kv.Value!.GetValue<int>())).DefaultIfEmpty(0).Max();
 
     // Ring settings can be shared between mirror twins, but the motor is a component reference, not a setting.
     // Clone before remapping so changing the twin never redirects the original ring as well.
@@ -166,17 +241,10 @@ public static class Conversion
         var b = Parse(json);
         var objects = Objects(b);
         if (!objects.TryGetValue(ringId, out var ring) || GuidOf(ring) != RingGuid) throw new Exception("该炮塔已不存在。");
-        var children = objects.Values.GroupBy(o => Id(o, "pvuid")).ToDictionary(g => g.Key, g => g.Select(o => Id(o, "vuid")).ToList());
-        List<int> Below(int top)
-        {
-            var found = new List<int>();
-            for (var queue = new Queue<int>(new[] { top }); queue.Count > 0;)
-                foreach (int c in children.GetValueOrDefault(queue.Dequeue()) ?? new()) { found.Add(c); queue.Enqueue(c); }
-            return found;
-        }
+        var children = ChildrenByParent(objects);
         int Flags(JsonObject o) => o["flags"]?.GetValue<int>() ?? 0;
         int? TwinOf(JsonObject o) => o["transform"]?["mirrorVuid"]?.GetValue<int>() is int m && m != Id(o, "vuid") && objects.ContainsKey(m) ? m : null;
-        var parts = Below(ringId);
+        var parts = Below(children, ringId);
         if (parts.Count == 0) throw new Exception("该炮塔上还没有可镜像的内容。");
 
         if (TwinOf(ring) is not int twinRing)
@@ -187,13 +255,14 @@ public static class Conversion
                 if (TwinOf(objects[v]) == null && (Flags(objects[v]) & 4) == 0) { objects[v]["flags"] = Flags(objects[v]) | 4; marked++; }
             return (b.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), marked, "marked mirrored");
         }
+        if (GuidOf(objects[twinRing]) != RingGuid || TwinOf(objects[twinRing]) != ringId)
+            throw new Exception("该炮塔的镜像链接并非互为镜像的炮塔对；原设计未改动。");
 
         // New numbers for each copy and its components; the ring's map to the twin ring's.
-        int next = objects.Values.SelectMany(o => o.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && kv.Key is not ("pvuid" or "flags"))
-                                                   .Select(kv => kv.Value!.GetValue<int>())).DefaultIfEmpty(0).Max() + 1;
+        int next = HighestNumber(objects) + 1;
         var map = new Dictionary<int, int> { [ringId] = twinRing };
         foreach (var key in ComponentKeys(ring)) if (objects[twinRing][key] is JsonValue tv) map[Id(ring, key)] = tv.GetValue<int>();
-        var onTwin = Below(twinRing).ToHashSet();
+        var onTwin = Below(children, twinRing).ToHashSet();
         var copy = new List<int>();
         foreach (int v in parts)
         {
@@ -228,6 +297,8 @@ public static class Conversion
             foreach (var key in ComponentKeys(o)) d[key] = map[Id(o, key)];
             RemapRingMotor(d, blocks, map, ref nextBlock);
             if (o["structureID"] is JsonValue s && map.TryGetValue(s.GetValue<int>(), out int body)) d["structureID"] = body;
+            if (o["compartmentBodyID"]?["structureVuid"] is JsonValue nestedBody && map.TryGetValue(nestedBody.GetValue<int>(), out int copiedBody))
+                d["compartmentBodyID"]!["structureVuid"] = copiedBody;
             // Mirrored across the vehicle's centre: seen from its (mirrored) parent, x the other way and the turn mirrored.
             var t = d["transform"]!.AsObject();
             var pos = t["pos"]!.AsArray();
@@ -239,15 +310,10 @@ public static class Conversion
             foreach (var key in d.Where(kv => kv.Key.EndsWith("BlueprintVuid")).Select(kv => kv.Key).ToList())
             {
                 var block = blocks.First(x => x!["id"]?.GetValue<int>() == d[key]!.GetValue<int>())!;
-                var named = block["blueprint"]?.AsObject().Where(kv => kv.Key is "operatedBehaviours" or "barrelVuids" && kv.Value is JsonArray).Select(kv => kv.Key).ToList() ?? new();
-                if (named.Count == 0) continue;
-                var own = JsonNode.Parse(block.ToJsonString())!.AsObject();
+                if (block["blueprint"]?.AsObject() is not { } settings || !NamesParts(settings)) continue;
+                var own = Clone(block).AsObject();
                 own["id"] = nextBlock;
-                foreach (var name in named)
-                {
-                    var ids = own["blueprint"]![name]!.AsArray();
-                    for (int i = 0; i < ids.Count; i++) if (ids[i] is JsonValue iv && map.TryGetValue(iv.GetValue<int>(), out int to)) ids[i] = to;
-                }
+                RemapNamedParts(own["blueprint"]!.AsObject(), map);
                 blocks.Add(own);
                 d[key] = nextBlock++;
             }
@@ -277,8 +343,164 @@ public static class Conversion
         var all = Objects(b);
         foreach (int v in copy)
             if (!Near(Shape(all[v]) * flip, Shape(all[map[v]]))) throw new Exception($"对应炮塔与本炮塔不成镜像（部件 {v}）；未作改动。");
-        return (b.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), copy.Count, "copied onto the twin ring");
+        // A partial twin may already have both drives with either ring on the other one's motor, so repair those too.
+        var drives = RepairMirroredTurretDrives(b.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+        return (drives.Json, copy.Count, drives.Repaired == 0 ? "copied onto the twin ring" : "copied onto the twin ring; drive connections repaired");
     }
+
+    /// Fills the bare ring that Alt-copying a turret ring leaves behind. The game duplicates only the ring it was told
+    /// to (its own parts and settings blocks, dropped where the user put it) and never fixes the two links a ring names
+    /// by number, so the copy goes on naming the original's traverse motor and turret body: two rings then claim one
+    /// drive, the rebuild gives the copy no turret behaviour, and leaving the editor crashes in the game's own audio
+    /// stage. So the turret that stands on the original ring is copied here instead, at the design level, onto the
+    /// copy's ring: every part with its own numbers, its own settings and its own shape, hung from the copy ring with
+    /// the same local transforms it has on the original, and the copy ring left naming its own body and its own drive.
+    public static (string Json, int Copied, string How) CopyTurret(string json, int sourceRingId, int copyRingId)
+    {
+        var b = Parse(json);
+        var objects = Objects(b);
+        if (!objects.TryGetValue(sourceRingId, out var source) || GuidOf(source) != RingGuid) throw new Exception("被复制的炮塔已不存在。");
+        if (!objects.TryGetValue(copyRingId, out var copy) || GuidOf(copy) != RingGuid) throw new Exception("副本齿圈已不存在。");
+        var children = ChildrenByParent(objects);
+        if (Below(children, copyRingId).Count != 0) throw new Exception("副本齿圈上已经有零件；原设计未改动。");
+        var parts = Below(children, sourceRingId);
+        if (parts.Count == 0) throw new Exception("被复制的炮塔上还没有内容。");
+
+        // Which part owns each component number: a settings value that happens to match one must never be taken for a
+        // link, and a turret that names parts outside itself (a seat linked to a hull gun) would take those links along.
+        var owner = new Dictionary<int, int>();
+        foreach (var o in objects.Values)
+            foreach (var key in ComponentKeys(o)) owner[Id(o, key)] = Id(o, "vuid");
+        var onSource = parts.ToHashSet();
+        onSource.Add(sourceRingId);
+        var theirs = onSource.Concat(owner.Where(kv => onSource.Contains(kv.Value)).Select(kv => kv.Key)).ToHashSet();
+        foreach (int v in onSource)
+            foreach (var (field, at) in LinksOf(objects[v]))
+                if (at > 0 && !theirs.Contains(at) && !(v == sourceRingId && field == "pvuid"))
+                    throw new Exception($"这个炮塔的部件 {v} 通过 {field} 引用了塔外的 {at}，复制会连带那个零件；暂不支持。");
+
+        // The numbers the game already gave the copy ring stand; everything it left behind gets a fresh one.
+        var map = new Dictionary<int, int> { [sourceRingId] = copyRingId };
+        foreach (var key in ComponentKeys(source))
+            if (copy[key] is JsonValue has && has.TryGetValue<int>(out int already) && already > 0) map[Id(source, key)] = already;
+        int next = HighestNumber(objects) + 1;
+        foreach (int v in parts)
+        {
+            map[v] = next++;
+            foreach (var key in ComponentKeys(objects[v])) map[Id(objects[v], key)] = next++;
+        }
+        int Resolve(int at) => map.TryGetValue(at, out int to) ? to : throw new Exception($"部件 {at} 没有对应的副本；原设计未改动。");
+
+        var blocks = b["blueprints"]!.AsArray();
+        var blockById = blocks.ToDictionary(x => Id(x!, "id"), x => x!.AsObject());
+        int nextBlock = blockById.Keys.DefaultIfEmpty(0).Max() + 1;
+        var meshes = b["meshes"]!.AsArray();
+        int nextMesh = meshes.Select(m => m!["vuid"]!.GetValue<int>()).DefaultIfEmpty(0).Max() + 1;
+        // Settings blocks the copy ring already owns (the game made its own ring and basket ones) are used as they are;
+        // one is only reused when nothing but the copy refers to it, so the two turrets never share a setting by accident.
+        var blockMap = new Dictionary<int, int>();
+        foreach (var kv in source.Where(kv => NamesBlock(kv.Key)).ToList())
+        {
+            if (kv.Value is not JsonValue original || !original.TryGetValue<int>(out int from)) continue;
+            if (copy[kv.Key] is not JsonValue at || !at.TryGetValue<int>(out int cid) || !blockById.ContainsKey(cid)) continue;
+            if (!blockById.TryGetValue(from, out var setting) || setting["type"]?.GetValue<string>() != blockById[cid]["type"]?.GetValue<string>()) continue;
+            if (objects.Values.Any(o => Id(o, "vuid") != copyRingId && o.Any(n => NamesBlock(n.Key) && n.Value is JsonValue v && v.TryGetValue<int>(out int x) && x == cid))) continue;
+            blockMap[from] = cid;
+        }
+
+        var list = b["objects"]!.AsArray();
+        foreach (int v in parts)
+        {
+            var o = objects[v];
+            var d = Clone(o);
+            d["vuid"] = map[v];
+            d["pvuid"] = Id(o, "pvuid") == sourceRingId ? copyRingId : Resolve(Id(o, "pvuid"));
+            foreach (var key in ComponentKeys(o)) d[key] = Resolve(Id(o, key));
+            if (o["structureID"] is JsonValue shell && shell.TryGetValue<int>(out int body) && body > 0) d["structureID"] = Resolve(body);
+            if (o["compartmentBodyID"]?.AsObject()["structureVuid"] is JsonValue nested && nested.TryGetValue<int>(out int inner) && inner > 0 && d["compartmentBodyID"] is JsonObject compartment)
+                compartment["structureVuid"] = Resolve(inner);
+            RemapNestedLinks(d, Resolve); // and what its own nested settings name: a mantlet's drive, trunnions, shield
+            // Its settings name parts, and a shape is only shared on purpose (mirror twins); a copy needs its own.
+            foreach (var key in d.Where(kv => NamesBlock(kv.Key)).Select(kv => kv.Key).ToList())
+            {
+                int from = d[key]!.GetValue<int>();
+                if (blockMap.TryGetValue(from, out int reuse)) { d[key] = reuse; continue; }
+                if (!blockById.TryGetValue(from, out var setting)) throw new Exception($"蓝图缺少设置 {from}。");
+                var own = Clone(setting);
+                own["id"] = nextBlock;
+                blockById[nextBlock] = own;
+                blockMap[from] = nextBlock;
+                d[key] = nextBlock;
+                if (own["type"]?.GetValue<string>() == "structure") nextMesh = OwnShape(own, meshes, nextMesh);
+                blocks.Add(own);
+                nextBlock++;
+            }
+            if (d["transform"]?.AsObject() is { } transform && transform["mirrorVuid"] is JsonValue mv && mv.TryGetValue<int>(out int mirror) && mirror > 0)
+                transform["mirrorVuid"] = map.TryGetValue(mirror, out int twin) ? twin : -1; // its mirror image does not belong to this turret
+            list.Add(d);
+        }
+        if (source["structureID"] is JsonValue rb && rb.TryGetValue<int>(out int itsBody) && itsBody > 0) copy["structureID"] = Resolve(itsBody);
+        if (source["compartmentBodyID"]?.AsObject()["structureVuid"] is JsonValue rc && rc.TryGetValue<int>(out int itsShell) && itsShell > 0 && copy["compartmentBodyID"] is JsonObject itsInner)
+            itsInner["structureVuid"] = Resolve(itsShell);
+        foreach (int id in blockMap.Values.Distinct().ToList()) // and the copy's settings must name the copy's own parts
+            if (blockById[id]["blueprint"]?.AsObject() is { } settings) RemapNamedParts(settings, map);
+
+        // Then check the result before anything is written: nothing on the copy may name the turret it came from,
+        // every part it holds must have come along, and each one must sit where the copy's own ring puts it.
+        var after = Objects(b);
+        var filled = Below(ChildrenByParent(after), copyRingId);
+        if (filled.Count != parts.Count) throw new Exception($"副本齿圈上只有 {filled.Count} 件，应为 {parts.Count} 件；原设计未改动。");
+        var ours = blockMap.Values.ToHashSet();
+        var ourNumbers = filled.Append(copyRingId).SelectMany(v => new[] { v }.Concat(ComponentKeys(after[v]).Select(k => Id(after[v], k)))).ToHashSet();
+        foreach (int v in filled.Append(copyRingId))
+        {
+            foreach (var (field, at) in LinksOf(after[v]))
+                if (at > 0 && !ourNumbers.Contains(at) && !(v == copyRingId && field == "pvuid"))
+                    throw new Exception($"副本的部件 {v} 仍通过 {field} 引用原炮塔的 {at}；原设计未改动。");
+            foreach (var kv in after[v].Where(kv => NamesBlock(kv.Key)))
+                if (!ours.Contains(kv.Value!.GetValue<int>())) throw new Exception($"副本的部件 {v} 仍共用原炮塔的设置 {kv.Value}；原设计未改动。");
+        }
+        foreach (int id in ours)
+            if (blockById[id]["blueprint"]?.AsObject() is { } settings)
+                foreach (int at in NamedParts(settings))
+                    // Only the turret's own parts had to come along. A seat here that drives the hull's steering keeps
+                    // driving it, exactly as the mirror does: numbers outside the source turret stay as they were.
+                    if (!ourNumbers.Contains(at) && theirs.Contains(at)) throw new Exception($"副本的设置 {id} 仍引用原炮塔的 {at}；原设计未改动。");
+        var world = WorldMatrices(after);
+        if (!Matrix4x4.Invert(world[sourceRingId], out var back)) throw new Exception("原齿圈的变换不可逆。");
+        var move = back * world[copyRingId];
+        foreach (int v in parts)
+            if (!Near(world[v] * move, world[map[v]])) throw new Exception($"副本的部件 {v} 会移位或形变；原设计未改动。");
+        return (b.ToJsonString(new JsonSerializerOptions { WriteIndented = true }), parts.Count,
+            $"ring {sourceRingId} → {copyRingId}: {parts.Count} parts copied with their own body and traverse motor");
+    }
+
+    /// The numbers one part names that belong to a part: its own components, the part it hangs from, its body and mirror
+    /// links, and what its own nested settings name. Not settings blocks (another number space) and not plain settings.
+    internal static List<(string Field, int Value)> LinksOf(JsonObject o)
+    {
+        var found = new List<(string, int)> { ("pvuid", Id(o, "pvuid")) };
+        found.AddRange(ComponentKeys(o).Select(k => (k, Id(o, k))));
+        if (o["structureID"] is JsonValue body && body.TryGetValue<int>(out int at)) found.Add(("structureID", at));
+        if (o["compartmentBodyID"]?.AsObject()["structureVuid"] is JsonValue shell && shell.TryGetValue<int>(out int nested)) found.Add(("compartmentBodyID", nested));
+        if (o["transform"]?["mirrorVuid"] is JsonValue mv && mv.TryGetValue<int>(out int mirror)) found.Add(("mirrorVuid", mirror));
+        found.AddRange(NestedLinksOf(o));
+        return found;
+    }
+
+    /// Gives a copied structure a shape of its own, so armour edited on the copy later cannot change the original.
+    static int OwnShape(JsonObject block, JsonArray meshes, int nextMesh)
+    {
+        if (block["blueprint"]?.AsObject() is not { } settings || settings["bodyMeshVuid"] is not JsonValue mesh || !mesh.TryGetValue<int>(out int meshId)) return nextMesh;
+        if (meshes.FirstOrDefault(m => m!["vuid"]?.GetValue<int>() == meshId) is not { } shared) return nextMesh;
+        var own = Clone(shared);
+        own["vuid"] = nextMesh;
+        settings["bodyMeshVuid"] = nextMesh;
+        meshes.Add(own);
+        return nextMesh + 1;
+    }
+
+    internal static JsonObject Clone(JsonNode node) => JsonNode.Parse(node.ToJsonString())!.AsObject();
 
     public static Matrix4x4 Local(JsonNode transform, bool scaled = true)
     {
@@ -287,7 +509,7 @@ public static class Conversion
         // Unity Euler order: Z, then X, then Y. System.Numerics uses row vectors.
         return Matrix4x4.CreateScale(scaled ? Vec("scale") : Vector3.One) * Matrix4x4.CreateRotationZ(r.Z) * Matrix4x4.CreateRotationX(r.X) * Matrix4x4.CreateRotationY(r.Y) * Matrix4x4.CreateTranslation(Vec("pos"));
     }
-    public static Dictionary<int, Matrix4x4> WorldMatrices(Dictionary<int, JsonObject> objects)
+    public static Dictionary<int, Matrix4x4> WorldMatrices(Dictionary<int, JsonObject> objects, bool attachmentFrames = false)
     {
         var cache = new Dictionary<int, Matrix4x4>();
         var frames = new Dictionary<int, Matrix4x4>();
@@ -310,8 +532,8 @@ public static class Conversion
             int parent = Id(o, "pvuid");
             return frames[id] = o.ContainsKey("mantlet") ? Local(o["transform"]!, scaled: false) * (parent < 0 ? Matrix4x4.Identity : Frame(parent)) : Get(id);
         }
-        foreach (int id in objects.Keys) Get(id);
-        return cache;
+        foreach (int id in objects.Keys) { Get(id); Frame(id); }
+        return attachmentFrames ? frames : cache;
     }
     internal static void WriteTransform(JsonObject transform, Matrix4x4 matrix)
     {

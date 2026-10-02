@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -11,6 +12,9 @@ using Sprocket.UI;
 using UnityEngine;
 using UnityEngine.Events;
 
+// SprocketClipboard（部件剪贴板，单独一个 mod）要用这里已经验过的设计编辑管线和蓝图 id 规则，免得两处各写一份、日后走样。
+[assembly: InternalsVisibleTo("SprocketClipboard")]
+
 namespace SprocketTools;
 
 /// SprocketTools: small editor improvements, each one a section in the game's own inspector panels.
@@ -20,6 +24,7 @@ public sealed class Plugin : BasePlugin
     internal static ManualLogSource ModLog = null!;
     internal static ConfigEntry<string>? Folded;
     internal static ConfigEntry<bool>? ShowHotkeys;
+    internal static ConfigEntry<bool>? PartMassMarkers;
     internal static ConfigEntry<bool>? DrawingNoWireframe;
     internal static ConfigEntry<bool>? DrawingSeeThroughOutline;
     internal static ConfigEntry<bool>? DrawingColourOutline;
@@ -63,6 +68,7 @@ public sealed class Plugin : BasePlugin
         ExplodeSpread = Config.Bind("Panels", "Exploded view spread", 0.5f, "爆炸视图（F2）把部件移开的距离，单位为米（F3 / F4 调整）");
         FlashlightPercent = Config.Bind("Panels", "Flashlight brightness", 80f, "手电筒（F6）照射位置的亮度，按太阳光强度的百分比计");
         FullbrightPercent = Config.Bind("Panels", "Fullbright brightness", 25f, "全亮（F7）的 14 个灯各自的亮度，按太阳光强度的百分比计");
+        PartMassMarkers = Config.Bind("Panels", "Part mass markers", true, "部件质心标记：右下角视图筛选开启质心（COM）时，每个部件画出自己的蓝色质心菱形。关掉只留整车质心。");
         RotationSnap = Config.Bind("Editor", "Rotation snap (degrees)", 0f, "游戏旋转捕捉开启时，以本值（度）作为转动步进，代替游戏自带的（7.5 可作出 48 边圆，5 作出 72 边）。填 0 保持游戏步进。");
         MirrorMerge = Config.Bind("Editor", "Mirror merge", true, "编辑器镜像开启时，合并（M）会连同另一侧的镜像点一起合并。");
         BackupsKept = Config.Bind("Backups", "Backups kept", 50, "保留多少份设计备份（BepInEx\\SprocketToolsBackups，每次修改一份）；超出时先删最旧的。填 0 表示全部保留。");
@@ -98,7 +104,7 @@ public sealed class Plugin : BasePlugin
         AddComponent<DesignEditor>();
         long setupMs = loadWatch.ElapsedMilliseconds;
         var harmony = new Harmony("local.sprocket.tools");
-        var features = new[] { typeof(InspectorSection), typeof(TurretDriveRepair), typeof(ShapeTools), typeof(RestoreSection), typeof(HoleQuality), typeof(MeshTools), typeof(MergeFaces), typeof(Hotkeys), typeof(TurretCopy), typeof(ExplodedView), typeof(GunLength), typeof(GearSpeeds), typeof(PartPaint), typeof(ImageAddresses), typeof(DrawingSheet.NoHover), typeof(DrawingSettings), typeof(RotationSnap), typeof(MirrorMerge), typeof(PanelFit) };
+        var features = new[] { typeof(InspectorSection), typeof(MassMarkers), typeof(TurretDriveRepair), typeof(TurretMotorLifecycle), typeof(ShapeTools), typeof(RestoreSection), typeof(HoleQuality), typeof(MeshTools), typeof(MergeFaces), typeof(Hotkeys), typeof(TurretCopy), typeof(ExplodedView), typeof(GunLength), typeof(GearSpeeds), typeof(PartPaint), typeof(PartPaint.SavedPaintLoad), typeof(ImageAddresses), typeof(DrawingSheet.NoHover), typeof(DrawingSettings), typeof(RotationSnap), typeof(MirrorMerge), typeof(PanelFit) };
         var timings = new List<(string name, long ms)>();
         foreach (var feature in features)
         {

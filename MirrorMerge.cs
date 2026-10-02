@@ -81,13 +81,11 @@ public static class MirrorMerge
         Selection.Only(mesh, p.Images);
         again = true;
         try { AccessTools.Method(typeof(MergeOp), "ExecuteInternal").Invoke(__instance, new object[] { mesh }); }
-        finally { again = false; }
+        finally { again = false; selected.Restore(mesh); mesh.MarkDirty(MeshDirtyFlags.All); }
         alive = Alive(mesh);
         var image = p.Images.Where(x => alive.Contains(x.Pointer)).ToList();
         // Exactly opposite, so Mirror pairs the two merged points.
         if (image.Count == 1) image[0].position = new Vector3(-at.x, at.y, at.z);
-        selected.Restore(mesh);
-        mesh.MarkDirty(MeshDirtyFlags.All);
         Plugin.ModLog.LogInfo(image.Count == 1 ? $"Mirror merge: the {p.Images.Count} mirrored points merged too, at ({-at.x:0.####}, {at.y:0.####}, {at.z:0.####})"
                                                : $"Mirror merge: the game's merge of the mirrored points left {image.Count} of them");
     });
@@ -104,12 +102,14 @@ public static class MirrorMerge
     sealed class Selection
     {
         readonly List<Element> flagged = new(), listed = new();
-        ushort points, edges, faces, loops;
+        readonly HashSet<IntPtr> selectedLoops = new();
 
         public static Selection Save(EditMesh mesh)
         {
-            var s = new Selection { points = mesh.selectedVertexCount, edges = mesh.selectedEdgeCount, faces = mesh.selectedFaceCount, loops = mesh.selectedLoopCount };
+            var s = new Selection();
             foreach (var e in All(mesh)) if (e.HasFlag(ElementFlags.Selected)) s.flagged.Add(e);
+            var loops = mesh.loops;
+            for (int i = 0; i < loops.Count; i++) if ((loops[i].flags & LoopFlags.Selected) != 0) s.selectedLoops.Add(loops[i].Pointer);
             var list = mesh.selection;
             for (int i = 0; i < list.Count; i++) s.listed.Add(list[i]);
             return s;
@@ -119,6 +119,8 @@ public static class MirrorMerge
         public static void Only(EditMesh mesh, List<Vertex> points)
         {
             foreach (var e in All(mesh)) e.DisableFlag(ElementFlags.Selected);
+            var loops = mesh.loops;
+            for (int i = 0; i < loops.Count; i++) loops[i].flags &= ~LoopFlags.Selected;
             mesh.selection.Clear();
             foreach (var v in points) { v.EnableFlag(ElementFlags.Selected); mesh.selection.Add(v); }
             mesh.selectedVertexCount = (ushort)points.Count;
@@ -132,10 +134,24 @@ public static class MirrorMerge
             foreach (var e in flagged) if (alive.Contains(e.Pointer)) e.EnableFlag(ElementFlags.Selected);
             mesh.selection.Clear();
             foreach (var e in listed) if (alive.Contains(e.Pointer)) mesh.selection.Add(e);
-            mesh.selectedVertexCount = points;
-            mesh.selectedEdgeCount = edges;
-            mesh.selectedFaceCount = faces;
-            mesh.selectedLoopCount = loops;
+            // Removed elements no longer contribute to selection counters.
+            static ushort Count<T>(Il2CppSystem.Collections.Generic.List<T> items) where T : Element
+            {
+                int count = 0;
+                for (int i = 0; i < items.Count; i++) if (items[i].HasFlag(ElementFlags.Selected)) count++;
+                return (ushort)Math.Min(count, ushort.MaxValue);
+            }
+            mesh.selectedVertexCount = Count(mesh.vertices);
+            mesh.selectedEdgeCount = Count(mesh.edges);
+            mesh.selectedFaceCount = Count(mesh.faces);
+            int loopCount = 0;
+            var loops = mesh.loops;
+            for (int i = 0; i < loops.Count; i++)
+            {
+                if (selectedLoops.Contains(loops[i].Pointer)) { loops[i].flags |= LoopFlags.Selected; loopCount++; }
+                else loops[i].flags &= ~LoopFlags.Selected;
+            }
+            mesh.selectedLoopCount = (ushort)Math.Min(loopCount, ushort.MaxValue);
         }
 
         static IEnumerable<Element> All(EditMesh mesh)

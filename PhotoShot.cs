@@ -18,6 +18,7 @@ internal static class PhotoShot
     static SprocketApplication? app;
     static SettingsProfile? before;
     static bool overlayWas;
+    static int captureId; // a shot that comes in late must not write over a newer one's file
     static string file = "";
 
     /// While true nothing of the mod draws on screen (it would be in the photo).
@@ -28,10 +29,11 @@ internal static class PhotoShot
         try
         {
             if (step >= 0) { Advance(); return; }
-            if (Keyboard.current is not { } keys || !keys.f8Key.wasPressedThisFrame) return;
+            if (DrawingSheet.Capturing || Keyboard.current is not { } keys || !keys.f8Key.wasPressedThisFrame) return;
             overlay = UnityEngine.Object.FindObjectOfType<PhotomodeOverlay>();
             app = UnityEngine.Object.FindObjectOfType<SprocketApplication>();
             if (overlay == null || app == null) return; // not in photo mode
+            captureId++; // anything still pending from an earlier attempt is now too late
             var current = app.CurrentSettings;
             before = Profile(current, current.Graphics.Copy());
             var max = Profile(current, current.Graphics.Copy());
@@ -60,7 +62,7 @@ internal static class PhotoShot
             if (step == 0 && frames >= SettleFrames)
             {
                 shotDone = false; shotError = null;
-                if (DesignEditor.Instance is { } editor) editor.StartCoroutine(Shoot().WrapToIl2Cpp());
+                if (DesignEditor.Instance is { } editor) editor.StartCoroutine(Shoot(captureId, file).WrapToIl2Cpp());
                 else throw new InvalidOperationException("no editor to run photo coroutine");
                 step = 1; frames = 0;
             }
@@ -92,9 +94,12 @@ internal static class PhotoShot
 
     /// The finished frame, as shown on screen, saved as a PNG. (The game's own ScreenCapture.CaptureScreenshot can't be
     /// called from a mod: its file name doesn't pass through.)
-    static System.Collections.IEnumerator Shoot()
+    static System.Collections.IEnumerator Shoot(int id, string destination)
     {
         yield return new WaitForEndOfFrame(); // after everything is drawn
+        // A timed-out or restored shot must not capture restored settings, overwrite a later shot's file, or report
+        // completion for a capture that is no longer the current one.
+        if (id != captureId || step < 0) yield break;
         Texture2D? shot = null;
         try
         {
@@ -112,18 +117,19 @@ internal static class PhotoShot
             // particle coverage/distortion values. Encoding that alpha makes viewers blend the smoke AGAIN.
             // Save an opaque RGB photograph without multiplying or compositing its already-finished colours.
             // GetPixels32 and SavePng both use bottom-up rows, so the original orientation is preserved.
-            Drawing.SavePng(file, shot.width, shot.height, rgb);
+            Drawing.SavePng(destination, shot.width, shot.height, rgb);
             Plugin.ModLog.LogInfo($"TOOL_PHOTO opaque RGB output; discarded render alpha on {nonOpaque} pixels");
         }
-        catch (Exception ex) { shotError = ex; }
+        catch (Exception ex) { if (id == captureId) shotError = ex; }
         finally { if (shot != null) UnityEngine.Object.Destroy(shot); }
-        shotDone = true;
+        if (id == captureId) shotDone = true;
     }
 
     /// Settings back as they were, and the overlay if it was showing.
     static void Restore()
     {
         step = -1;
+        captureId++; // a frame still to come is from the attempt that ends here
         try { if (app != null && before != null) app.ApplySettings(before); }
         catch (Exception ex) { Plugin.ModLog.LogError($"TOOL_PHOTO couldn't put the graphics settings back (reopen Settings to fix): {ex}"); }
         try { if (overlay != null && overlayWas) overlay.SetOverlayVisible(true); } catch { }

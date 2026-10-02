@@ -39,6 +39,8 @@ public static class Hotkeys
     /// The hand-made structure being edited (its part selected), or null.
     internal static PlateStructureEditor? Current => StructureSelected() ? structure : null;
     static List<string>? lines;
+    /// 别的 mod（本仓库内的部件剪贴板）往这张表里追加的按键行，装载时登记一次。空着就是不装那个 mod。
+    internal static readonly List<string> Extra = new();
     static float[]? heights; // what each of those lines takes to draw without clipping
     static bool measured;
     static int checkedFrame = -1;
@@ -183,6 +185,8 @@ public static class Hotkeys
             InputActionRebindingExtensions.GetBindingDisplayString(vertical, default(InputBinding.DisplayStringOptions), (string?)null) is { Length: > 0 } up)
             found.Insert(5, $"Shift+{up}  移动/缩放时不改高度   [mod]");
         found.Add("Ctrl+J  将所选附加部件合并到最后选中的那个   [mod]");
+        // 另一个程序集（部件剪贴板）装载时交过来的按键行：它自己画不了这个框，这里的行不来自游戏的绑定表。
+        foreach (var line in Extra) found.Add(line);
         found.Add("N  展平     T  循环切割（需选边）     I  内插面     V  倒角（需选边）   [mod]");
         found.Add("O  比例编辑     U  选择同向相连面   [mod]");
         found.Add("小键盘5  正交视图     小键盘 +/-  正交缩放   [mod]");

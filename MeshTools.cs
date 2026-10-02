@@ -27,6 +27,7 @@ public static class MeshTools
     // The game's Delete operation, given nothing to delete, carries a tool so it gets the game's undo and mesh rebuild.
     // Only these instances run a tool; every other Delete runs as normal.
     static readonly Dictionary<IntPtr, (DeleteOp Op, string Name, Func<EditMesh, (bool Done, string Message)> Apply)> ours = new();
+    static readonly Dictionary<IntPtr, IntPtr> carriedTools = new();
     static PlateStructureEditOperations? notify;
 
     [HarmonyPrefix, HarmonyPatch(typeof(DeleteOp), "ExecuteInternal")]
@@ -70,11 +71,41 @@ public static class MeshTools
 
     internal static void Run(PlateStructureEditor editor, string name, Func<EditMesh, (bool, string)> apply) => Ui.Guard(name, () =>
     {
+        var designer = DesignEditor.Instance;
+        if (DesignEditor.IsCapturing || designer?.Core?.Editor?.OperationInProgress == true)
+        {
+            editor.operations.NotifyError(name + "：请先完成当前的网格编辑或出图，再使用此工具");
+            return;
+        }
         var op = new DeleteOp(DeleteType.None) { Name = name };
         ours[op.Pointer] = (op, name, apply);
         var ops = notify = editor.operations;
-        ops.Execute(editor.meshEditor.CreateTopoOp(op), StructureEditOperationOptions.None, ops.GetNewGroupID());
-        editor.meshEditor.SelectFlush();
+        bool retained = false;
+        try
+        {
+            var carried = ops.Execute(editor.meshEditor.CreateTopoOp(op), StructureEditOperationOptions.None, ops.GetNewGroupID());
+            if (carried?.operation is { } historyOp)
+            {
+                carriedTools[historyOp.Pointer] = op.Pointer;
+                retained = true;
+            }
+            else ours.Remove(op.Pointer);
+            editor.meshEditor.SelectFlush();
+        }
+        catch { if (!retained) ours.Remove(op.Pointer); throw; }
+        finally { notify = null; }
+    });
+
+    // Keep tool callbacks for redo only as long as their native undo operation lives.
+    // ReleaseInternal is invoked when the game discards/clears an operation's history.
+    [HarmonyPrefix, HarmonyPatch(typeof(global::Operations.Operation), nameof(global::Operations.Operation.ReleaseInternal))]
+    static void ReleaseTool(global::Operations.Operation __instance) => Ui.Guard("Mesh tool history", () =>
+    {
+        if (carriedTools.TryGetValue(__instance.Pointer, out var tool))
+        {
+            carriedTools.Remove(__instance.Pointer);
+            ours.Remove(tool);
+        }
     });
 
     /// The mesh as indices: every face's corners (in its own turning), point positions, and what's selected.
@@ -328,8 +359,8 @@ public static class MeshTools
     static MeshPlans.FlattenMode flattenMode;
     static readonly string[] FlattenNames = { "展平：最佳拟合平面", "展平：水平（统一高度）", "展平：横向（统一 X）", "展平：纵向（统一 Z）" };
     static float insetMm = 50, bevelMm = 30, flatAngle = 5, radiusMm = 500;
-    static float smoothMm = 30;
-    static int smoothSegments = 4, splitSections = 2;
+    static float smoothMm = 30, filletRadiusMm = 30;
+    static int smoothSegments = 4, filletSegments = 4, splitSections = 2;
     static bool splitOtherDirection;
     static IntPtr lastSplitMesh;
     static List<Num[]> lastSplitFaces = new();
@@ -409,6 +440,19 @@ public static class MeshTools
             var v = new View(mesh);
             var edges = WithTwins(v, v.SelectedEdges, mirror).Select(k => FaceMerge.Key(k.Item1, k.Item2)).ToHashSet();
             return Apply(mesh, v, MeshPlans.Bevel(v.Pos, v.Corners, edges, width, segments), "smooth edge", preserveBevelEdges: true, roundedEdges: edges);
+        });
+    }
+
+    static void Fillet(PlateStructureEditor e)
+    {
+        if (e.meshEditor.SelectType != MeshEditType.Edge) { e.operations.NotifyError("圆角：切换到“边”并选择要圆角的边"); return; }
+        bool mirror = e.meshEditor.Symmetry;
+        float radius = filletRadiusMm / 1000; int segments = filletSegments;
+        Run(e, "Fillet", mesh =>
+        {
+            var v = new View(mesh);
+            var edges = WithTwins(v, v.SelectedEdges, mirror).Select(edge => FaceMerge.Key(edge.Item1, edge.Item2)).ToHashSet();
+            return Apply(mesh, v, EdgeFillet.Round(v.Pos, v.Corners, edges, radius, segments), "fillet", preserveBevelEdges: true, roundedEdges: edges);
         });
     }
 
@@ -1611,6 +1655,10 @@ public static class MeshTools
         ui.Slider("圆滑宽度（毫米）", smoothMm, 1, 500, Ui.FloatCallback(v => smoothMm = MathF.Round(v)));
         ui.Slider("圆滑分段", smoothSegments, 2, 16, Ui.FloatCallback(v => smoothSegments = Math.Clamp((int)MathF.Round(v), 2, 16)));
         ui.Button("圆滑边：选择边", Ui.Callback(() => SmoothEdge(__instance)), ref smoothTip);
+        var filletTip = new UITooltip("圆角", "在“边”模式下选择两个平面之间的拐角。半径是圆弧的真实尺寸（毫米），分段越多越圆滑。提示放不下时把半径改小。镜像生效；Ctrl+Z 一步撤销整个操作。");
+        ui.Slider("圆角半径（毫米）", filletRadiusMm, 1, 500, Ui.FloatCallback(v => filletRadiusMm = MathF.Round(v)));
+        ui.Slider("圆角分段", filletSegments, 2, 16, Ui.FloatCallback(v => filletSegments = Math.Clamp((int)MathF.Round(v), 2, 16)));
+        ui.Button("圆角：选择边", Ui.Callback(() => Fillet(__instance)), ref filletTip);
         var splitTip = new UITooltip("分割面", "在“面”模式下选择要分割的面。直线切割只发生在所选面内部，相邻面只在边界上补对应的点。方向 A/B 选取四边形面的另一组对边。镜像生效；关闭镜像则只改本侧。Ctrl+Z 一步撤销整个操作。");
         ui.Slider("分割段数", splitSections, 2, 16, Ui.FloatCallback(v => splitSections = Math.Clamp((int)MathF.Round(v), 2, 16)));
         ui.Button(splitOtherDirection ? "分割方向：B" : "分割方向：A", Ui.Callback(() => { splitOtherDirection = !splitOtherDirection; __instance.RequestRedraw(); }), ref splitTip);
@@ -1628,6 +1676,13 @@ public static class MeshTools
             if (Plugin.FullbrightPercent != null) Plugin.FullbrightPercent.Value = MathF.Round(v);
             FillBrightness();
         }));
+        ui.ToggleField("部件质心标记", MassMarkers.PartMarkersShown, Ui.BoolCallback(v =>
+        {
+            MassMarkers.SetPartMarkersShown(v);
+            __instance.RequestRedraw();
+        }), "右下角的视图筛选开启质心（COM）后，每个部件画出自己的蓝色质心菱形。关掉它只留整车质心；把 COM 关掉则两种都不画。");
+        if (MassMarkers.PartMarkersShown && !MassMarkers.MasterShown)
+            ui.InfoField("视图筛选里的 COM 当前是关的，部件质心标记暂时不显示。", 1);
         ui.ToggleField("允许贴近查看", closeZoom, Ui.BoolCallback(v => closeZoom = v),
             "相机可以贴近小部件到几厘米以内（游戏原本的最近距离远得多）。");
         ui.ToggleField("0.5 毫米网格", halfGrid, Ui.BoolCallback(v =>
@@ -1681,61 +1736,12 @@ public static class MeshTools
 }
 
 /// Turrets can be copied with Alt and mirrored like other parts: the game's turret ring part says it can't be duplicated
-/// or mirrored, and this lets it, in memory, as the game reads its part files (no game file changes). Copying a ring
-/// copies everything on it too (turret body, guns, ...), each copy on the copy of its own parent.
+/// or mirrored, and this lets it, in memory, as the game reads its part files (no game file changes). The game then
+/// duplicates only the ring it was given, so what stands on it is copied at the design level once the placing is done
+/// (see DesignEditor.FillCopiedTurrets and Conversion.CopyTurret).
 [HarmonyPatch]
 public static class TurretCopy
 {
-    // The parts added to the copy, with their parents: to put each copy on the copy of its parent afterwards.
-    static readonly List<(Sprocket.Vehicles.VehicleObject Part, Sprocket.Vehicles.VehicleObject Parent)> added = new();
-
-    [HarmonyPrefix, HarmonyPatch(typeof(Sprocket.VehicleDesigner.Operations.VehicleOperations), nameof(Sprocket.VehicleDesigner.Operations.VehicleOperations.Duplicate))]
-    static void WholeTurret(ref Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject> instances)
-    {
-        added.Clear();
-        Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject>? more = null;
-        var given = instances;
-        Ui.Guard("Turret copy", () => more = WithEverythingOnRings(given));
-        if (more != null) instances = more;
-    }
-
-    static Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject>? WithEverythingOnRings(Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject> instances)
-    {
-        var sources = instances.Select(i => i?.Object).Where(o => o != null).ToList();
-        if (!sources.Any(o => o!.GUID == Conversion.RingGuid)) return null;
-        var have = sources.Select(o => o!.Pointer).ToHashSet();
-        void Take(Sprocket.Vehicles.VehicleObject parent)
-        {
-            var children = parent.GetComponent<Sprocket.Vehicles.VehicleTransform>()?.Children;
-            if (children == null) return;
-            for (int i = 0; i < children.Cast<Il2CppSystem.Collections.Generic.IReadOnlyCollection<Sprocket.Vehicles.VehicleTransform>>().Count; i++)
-                if (children[i]?.VehicleObject is { } child && have.Add(child.Pointer)) { added.Add((child, parent)); Take(child); }
-        }
-        foreach (var ring in sources.Where(o => o!.GUID == Conversion.RingGuid).ToList()) Take(ring!);
-        if (added.Count == 0) return null;
-        Plugin.ModLog.LogInfo($"Turret copy: copying {added.Count} parts on the ring too");
-        return new Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject>(instances.Concat(added.Select(a => a.Part.GetReference())).ToArray());
-    }
-
-    [HarmonyPostfix, HarmonyPatch(typeof(Sprocket.VehicleDesigner.Operations.VehicleOperations), nameof(Sprocket.VehicleDesigner.Operations.VehicleOperations.Duplicate))]
-    static void Reattach(Sprocket.VehicleDesigner.Operations.VehicleOperations __instance, Sprocket.Vehicles.Operations.Duplicate __result, int groupID) => Ui.Guard("Turret copy", () =>
-    {
-        if (added.Count == 0 || __result == null) return;
-        int moved = 0, missing = 0;
-        foreach (var (part, parent) in added)
-        {
-            var copy = __result.GetDupe(part);
-            var copyParent = __result.GetDupe(parent);
-            if (copy == null || copyParent == null) { missing++; continue; }
-            if (copy.GetComponent<Sprocket.Vehicles.VehicleTransform>()?.Parent?.VehicleObject?.Pointer == copyParent.Pointer) continue;
-            __instance.SetParent(copyParent.GetReference(), new Il2CppReferenceArray<Sprocket.Vehicles.ISoftVehicleObject>(new[] { copy.GetReference() }), groupID);
-            moved++;
-        }
-        Plugin.ModLog.LogInfo($"Turret copy: {added.Count} parts copied with the ring; {moved} moved onto the new ring, {added.Count - moved - missing} already on it" +
-                              (missing > 0 ? $", {missing} copies not found" : ""));
-        added.Clear();
-    });
-
     [HarmonyPostfix, HarmonyPatch(typeof(PartDefinitionIO), nameof(PartDefinitionIO.DeserializePartDefinitionJSON))]
     static void AllowCopy(PartDefinition __result) => Ui.Guard("Turret copy", () =>
     {
