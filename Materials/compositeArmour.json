@@ -1,0 +1,15 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "复合装甲",
+    "rhaFactor": 1.4,
+    "spallFactor": 0.0002,
+    "density": 5600,
+    "costMultiplier": 4.5,
+    "compositePossible": true,
+    "compositeEffectiveness": 2.5
+  },
+  "type": "compositeArmour",
+  "date": "1900.01.01"
+}

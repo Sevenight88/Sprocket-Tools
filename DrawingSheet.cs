@@ -56,7 +56,7 @@ internal static class DrawingSheet
 
     internal static void Update()
     {
-        if (busy || PhotoShot.Capturing || Card.Capturing || Keyboard.current is not { } keys || !keys.f9Key.wasPressedThisFrame || MeshTools.Typing()) return;
+        if (busy || PhotoShot.Capturing || Card.Capturing || !Keybinds.Pressed("drawing") || MeshTools.Typing()) return;
         if (DesignEditor.Instance is not { } editor) return;
         if (editor.Core?.Editor?.OperationInProgress == true) return; // the game is mid-operation: its views would be taken half-changed
         busy = true;
@@ -900,7 +900,7 @@ internal static class DrawingSheet
                         if (seen.Add(cannon.Pointer) && cannon.Blueprint is { Caliber: > 0 } gun)
                         {
                             string called = Placeholder(gun.Name) ? "" : "  " + gun.Name.Trim();
-                            guns.Add($"{gun.Caliber} 毫米{called}   L/{gun.BarrelLength / (float)gun.Caliber:0.#}");
+                            guns.Add($"{gun.Caliber} 毫米{called}   L/{GunLength.Calibers(gun.BoreLength, gun.Caliber)}"); // as the Cannon panel shows it
                         }
                 var armament = string.Join("\n", guns.GroupBy(g => g).Select(g => (g.Count() > 1 ? $"{g.Count()} × " : "") + g.Key));
 
@@ -943,31 +943,15 @@ internal static class DrawingSheet
                 }
 
                 string speedText = "";
-                if (engine is { MaxRPM: > 0 } && gearbox != null && track?.BlueprintSlot?.HasBlueprint == true)
+                // 跟「速度与加速」面板同一套算法：平地、全油门，取传动最后停得住的那一挡的速度。
+                float mass = 0;
+                try { mass = (gearbox ?? (Sprocket.Vehicles.VehicleComponent?)track)?.Vehicle?.Mass ?? 0; } catch { }
+                if (GearSpeeds.TopSpeeds(engine, gearbox, tracks, mass) is { Forward: > 0 } top)
                 {
-                    var ratios = (gearbox.resultingDriveGearRatios?.ToArray() ?? Array.Empty<float>()).Select(Math.Abs).Where(r => r > 0).ToArray();
-                    var reverse = (gearbox.resultingReverseGearRatios?.ToArray() ?? Array.Empty<float>()).Select(Math.Abs).Where(r => r > 0).ToArray();
-                    float finalDrive = track.BlueprintSlot.Blueprint.FinalDriveRatio;
-                    var sprocket = track.SprocketAssembly?.WheelBlueprint;
-                    float radius = sprocket?.HasBlueprint == true ? sprocket.Blueprint.Radius : 0;
-                    if (ratios.Length > 0 && radius > 0 && finalDrive > 0)
-                    {
-                        float limit = float.MaxValue;
-                        try { if (track.TopSpeed > 0) limit = track.TopSpeed * 3.6f; } catch { }
-                        float Speed(float ratio) => Sprocket.VehicleDesigner.Powertrains.PowertrainInfo.CalculateSpeed(engine.MaxRPM, ratio * finalDrive, radius) * 3.6f;
-                        float fwdSpeed = Math.Min(Speed(ratios.Min()), limit);
-                        string fwdStr = MathF.Round(fwdSpeed).ToString("0", System.Globalization.CultureInfo.InvariantCulture);
-                        if (reverse.Length > 0)
-                        {
-                            float revSpeed = Math.Min(Speed(reverse.Min()), limit);
-                            string revStr = MathF.Round(revSpeed).ToString("0", System.Globalization.CultureInfo.InvariantCulture);
-                            speedText = $"极速：  {fwdStr} km/h（前进） / {revStr} km/h（倒车）";
-                        }
-                        else
-                        {
-                            speedText = $"极速：  {fwdStr} km/h";
-                        }
-                    }
+                    string Kmh(float v) => MathF.Round(v).ToString("0", System.Globalization.CultureInfo.InvariantCulture);
+                    speedText = top.Reverse > 0
+                        ? $"极速：  {Kmh(top.Forward)} km/h（前进） / {Kmh(top.Reverse)} km/h（倒车）"
+                        : $"极速：  {Kmh(top.Forward)} km/h";
                 }
 
                 var mobility = string.Join("\n", new[] { powerText, speedText }.Where(s => !string.IsNullOrEmpty(s)));

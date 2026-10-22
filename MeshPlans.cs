@@ -39,6 +39,9 @@ public static class MeshPlans
         foreach (var nf in plan.Add)
         {
             var c = nf.Corners;
+            // The game's own mesh duplication and blueprint loading only reserve room for three or four corners per
+            // face, so a five-corner face here is a crash waiting further down the line, not a shape.
+            if (c.Length > 4) return "新面会有四个以上的角点，请先拆成三角面或四边面";
             if (c.Length < 3 || c.Distinct().Count() != c.Length || c.Any(i => i < 0 || i >= at.Count)) return "新面会重复使用同一个角点";
             var n = Newell(at, c);
             var s = Newell(pos, faces[nf.Source]);
@@ -49,6 +52,7 @@ public static class MeshPlans
         }
         var removed = plan.Remove.ToHashSet();
         var after = faces.Where((_, i) => !removed.Contains(i)).Concat(plan.Add.Select(a => a.Corners)).ToList();
+        if (after.Any(f => f.Length > 4)) return "改完会有面超过四个角点，请先把它拆成三角面或四边面";
         // Tolerance follows the size of the patch being edited, not its distance from the world origin.
         var touched = plan.Remove.Concat(plan.Add.Select(f => f.Source)).Distinct().SelectMany(f => faces[f]).Distinct().Select(v => pos[v]).ToList();
         float extent = touched.Count == 0 ? 0 : Vector3.Distance(touched.Aggregate(Vector3.Min), touched.Aggregate(Vector3.Max));
@@ -302,6 +306,8 @@ public static class MeshPlans
     public static Rebuild Inset(IReadOnlyList<Vector3> pos, IReadOnlyList<int[]> faces, ICollection<int> selected, float width)
     {
         if (selected.Count == 0) return Rebuild.Fail("请先选择面");
+        if (!float.IsFinite(width) || width <= 0) return Rebuild.Fail("内插宽度须为正数");
+        if (selected.Any(f => f < 0 || f >= faces.Count)) return Rebuild.Fail("所选的面已不在当前网格上，请重新选择");
         var uses = new Dictionary<(int, int), int>();
         foreach (int f in selected)
             for (int k = 0; k < faces[f].Length; k++) uses[Key(faces[f][k], faces[f][(k + 1) % faces[f].Length])] = uses.GetValueOrDefault(Key(faces[f][k], faces[f][(k + 1) % faces[f].Length])) + 1;
@@ -366,6 +372,9 @@ public static class MeshPlans
         var edgeFaces = EdgeFaces(faces);
         var sel = edges.Select(e => Key(e.A, e.B)).Where(e => edgeFaces.TryGetValue(e, out var fs) && fs.Count == 2).ToHashSet();
         if (sel.Count == 0) return Rebuild.Fail("请选择两侧都有面的边");
+        // A side with no length would put two bevel points on the same spot; a non-finite one poisons every point after it.
+        if (sel.Any(e => e.Item1 < 0 || e.Item2 >= pos.Count || !Finite(pos[e.Item1]) || !Finite(pos[e.Item2])
+                || Vector3.DistanceSquared(pos[e.Item1], pos[e.Item2]) < 1e-16f)) return Rebuild.Fail("有一条选的边太长或短到看不见，无法倒角");
         var pointFaces = new Dictionary<int, List<int>>();
         for (int f = 0; f < faces.Count; f++)
             foreach (int v in faces[f])

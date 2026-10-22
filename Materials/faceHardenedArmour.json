@@ -1,0 +1,13 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "表面硬化装甲",
+    "rhaFactor": 1.1,
+    "spallFactor": 0.0008,
+    "density": 7850,
+    "costMultiplier": 2.2
+  },
+  "type": "faceHardenedArmour",
+  "date": "1900.01.01"
+}

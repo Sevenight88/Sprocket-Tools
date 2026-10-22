@@ -1,0 +1,13 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "铸均质装甲",
+    "rhaFactor": 0.92,
+    "spallFactor": 0.0009,
+    "density": 7350,
+    "costMultiplier": 1.2
+  },
+  "type": "castHomogeneousArmour",
+  "date": "1900.01.01"
+}

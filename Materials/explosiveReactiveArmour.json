@@ -1,0 +1,15 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "爆炸反应装甲",
+    "rhaFactor": 1.15,
+    "spallFactor": 0.0002,
+    "density": 2600,
+    "costMultiplier": 3.6,
+    "reactiveArmourPossible": true,
+    "eraEffectiveness": 2.2
+  },
+  "type": "explosiveReactiveArmour",
+  "date": "1900.01.01"
+}

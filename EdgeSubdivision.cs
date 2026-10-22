@@ -11,7 +11,7 @@ public static class EdgeSubdivision
         if (sections < 2 || sections > 16) return MeshPlans.Rebuild.Fail("分割段数请在 2 到 16 之间");
         // Checked before the edge tally below, which indexes the mesh by these very numbers.
         if (pos.Any(p => !float.IsFinite(p.X) || !float.IsFinite(p.Y) || !float.IsFinite(p.Z)) ||
-            faces.Any(f => f.Length < 3 || f.Distinct().Count() != f.Length || f.Any(v => v < 0 || v >= pos.Count)))
+            faces.Any(f => f.Length is not (3 or 4) || f.Distinct().Count() != f.Length || f.Any(v => v < 0 || v >= pos.Count)))
             return MeshPlans.Rebuild.Fail("网格含有无效的顶点或面");
         if (faceScope != null && (faceScope.Count == 0 || faceScope.Any(f => f < 0 || f >= faces.Count)))
             return MeshPlans.Rebuild.Fail("请先选择面");
@@ -80,12 +80,31 @@ public static class EdgeSubdivision
                 // Keep the neighbour as one face, only adding shared boundary vertices. This
                 // stops the cut here without introducing a crack or lines across the neighbour.
                 var boundary = new List<int>();
+                var uvCorners = c.Length == 4
+                    ? new[] { Vector3.Zero, Vector3.UnitX, new Vector3(1, 1, 0), Vector3.UnitY }
+                    : new[] { Vector3.Zero, Vector3.UnitX, Vector3.UnitY };
+                var uv = new List<Vector3>();
                 for (int k=0;k<c.Length;k++)
                 {
                     int a=c[k], b=c[(k+1)%c.Length]; boundary.Add(a);
-                    if (Cut(k)) for(int s=1;s<sections;s++) boundary.Add(OnEdge(a,b,s,sections));
+                    uv.Add(uvCorners[k]);
+                    if (Cut(k)) for(int s=1;s<sections;s++)
+                    {
+                        boundary.Add(OnEdge(a,b,s,sections));
+                        uv.Add(Vector3.Lerp(uvCorners[k], uvCorners[(k+1)%c.Length], s/(float)sections));
+                    }
                 }
-                add.Add(new(boundary.ToArray(),f));
+                // A flat corner loop triangulates off its own uv square; a bent or concave one off the real positions,
+                // so the fill never fans a set of overlapping triangles out of one corner.
+                var normal = HoleRing.Normal(c.Select(v => pos[v]).ToList());
+                bool convex = Enumerable.Range(0, c.Length).All(k =>
+                    Vector3.Dot(Vector3.Cross(pos[c[(k+1)%c.Length]] - pos[c[k]],
+                        pos[c[(k+2)%c.Length]] - pos[c[(k+1)%c.Length]]), normal) >= -1e-6f * normal.LengthSquared());
+                var layout = convex ? uv : boundary.Select(v => v < pos.Count ? pos[v] : points[v-pos.Count].P).ToList();
+                var filled = Fill.Region(layout, Enumerable.Range(0, boundary.Count).ToList(), new(), convex ? Vector3.UnitZ : normal, null);
+                if (filled.Count == 0 || filled.Any(face => face.Length is not (3 or 4)))
+                    return MeshPlans.Rebuild.Fail("旁边那个面分割后重建不成三角面或四边面");
+                add.AddRange(filled.Select(face => new MeshPlans.NewFace(face.Select(v => boundary[v]).ToArray(), f)));
                 continue;
             }
             if(c.Length==4)

@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -53,7 +53,9 @@ public static class AddonEdits
     static readonly Matrix4x4 Flip = Matrix4x4.CreateScale(-1, 1, 1);
 
     /// Where a part's shape sits: a flipped part (a mirror twin, or flipped to its side) shows its shape mirrored along its own x.
-    static Matrix4x4 Shape(JsonObject o, Matrix4x4 world) => ((o["flags"]?.GetValue<int>() ?? 0) & 1) != 0 ? Flip * world : world;
+    static Matrix4x4 Shape(JsonObject o, Matrix4x4 world) => ((o["flags"]?.GetValue<int>() ?? 0) & 1) != 0
+        && o["transform"]?["mirrorVuid"] is JsonValue m && m.TryGetValue<int>(out int t) && t >= 0 && t != Conversion.Id(o, "vuid")
+        ? Flip * world : world;
 
     /// Part `v`'s mirror twin when it really is one: linked both ways, the same mesh, and its shape the mirror image across
     /// the vehicle's centre (a link left over from moving one side with Mirror off doesn't count).
@@ -66,12 +68,32 @@ public static class AddonEdits
         return Conversion.Near(Shape(o, world[v]) * Flip, Shape(twin, world[t])) ? t : null;
     }
 
+    /// 互指的两条记录是不是游戏自己写下的那对镜像：局部变换照存档里的孪生写法 L_B = Flip × L_A × Flip。
+    /// 650 对互指记录里 592 对如此（含全部 110 对板孪生），剩下 58 对是「关着镜像挪过一边」留下的死链，
+    /// 这条判据一并拒掉 —— `tools\_mirror_scan6.mjs` 量的。
+    /// `Twin` 用的是「两侧形状互为镜像」，那只对翻转标记一深一浅的 462 对成立；板孪生两边都带翻转标记，
+    /// 一条也不认（差在 x 基向量的符号，最大元素差 2·缩放），所以拆镜像走这条。
+    static int? Partner(Dictionary<int, JsonObject> objects, int v)
+    {
+        var o = objects[v];
+        if (o["transform"]?["mirrorVuid"] is not JsonValue mv || !mv.TryGetValue<int>(out int t) || t == v || !objects.TryGetValue(t, out var twin)
+            || twin["transform"]?["mirrorVuid"]?.GetValue<int>() != v) return null;
+        return Conversion.Near(Flip * Conversion.Local(o["transform"]!) * Flip, Conversion.Local(twin["transform"]!)) ? t : null;
+    }
+
+    /// 两条记录共用同一份手工形状吗（存档里的 110 对板孪生全都共用）：共用了才需要给对侧复制一份。
+    static bool SharedShape(Dictionary<int, JsonObject> objects, JsonArray blocks, int a, int b) =>
+        MeshKey(blocks, objects[a]) == MeshKey(blocks, objects[b]);
+
+    /// 记录用的网格号（没有手工形状的记录返回 null）。
+    static int? MeshKey(JsonArray blocks, JsonObject o) =>
+        o["structureBlueprintVuid"] is JsonValue id ? Block(blocks, id.GetValue<int>())["blueprint"]?["bodyMeshVuid"]?.GetValue<int>() : null;
+
     /// A part saved once that the game shows twice: marked mirrored, with no twin part. The second one (its image) is its
     /// shape reflected across the vehicle's centre plane.
     static bool Imaged(Dictionary<int, JsonObject> objects, int v) =>
         ((objects[v]["flags"]?.GetValue<int>() ?? 0) & 4) != 0
         && !(objects[v]["transform"]?["mirrorVuid"] is JsonValue m && m.TryGetValue<int>(out int t) && t != v && objects.ContainsKey(t));
-
     /// A part stops being one of a mirror pair: no twin, and no mirrored mark (with the mark and no twin the game would
     /// show an image of it on the other side).
     internal static void Unlink(JsonObject o)
@@ -87,6 +109,206 @@ public static class AddonEdits
         Append(meshData["mesh"]!.AsObject(), meshData["rivets"]?.AsObject(), source["mesh"]!.AsObject(), source["rivets"]?.AsObject(), imageIntoShape);
         foreach (var s in structures) s["armourVolume"] = s["armourVolume"]!.GetValue<double>() + armour;
         Unlink(o);
+    }
+
+    /// 把形状沿自身 x 镜像（用于“镜像侧变实体”时，新件要用自己的点保持外观）。
+    static void MirrorShape(JsonObject meshData)
+    {
+        var source = Clone(meshData).AsObject();
+        var mesh = meshData["mesh"]!.AsObject();
+        foreach (var key in new[] { "vertices", "edges", "edgeFlags", "faces" }) mesh[key] = new JsonArray();
+        if (meshData["rivets"] is JsonObject rivets) { rivets["profiles"] = new JsonArray(); rivets["nodes"] = new JsonArray(); }
+        Append(mesh, meshData["rivets"]?.AsObject(), source["mesh"]!.AsObject(), source["rivets"]?.AsObject(), Flip);
+    }
+
+    /// 一个镜像件拆成两个独立件（改蓝图数据，两侧从此各点各的、各改各的；代价是不再联动）：
+    /// ① 孪生对（两条记录互指，共用一个设置块和一个网格）：给对侧一份自己的设置块与网格，再断开互指；
+    /// ② 单记录镜像（只有一条记录，对侧由游戏自己画）：新建一条记录摆到对侧、各拿一份网格，原件清掉"镜像显示"标记。
+    /// 对侧的摆法照游戏自己的孪生写法：同一个父件、同样的翻转标记、局部变换 L' = Flip × L × Flip
+    /// （存档里 110 对镜像孪生全部如此，`tools\_mirror_scan3.mjs` 量出来的）。
+    public static (string Json, int Focus, string Log) DetachMirror(string json, int part)
+    {
+        var b = Conversion.Parse(json);
+        var objects = Conversion.Objects(b);
+        if (!objects.TryGetValue(part, out var o)) throw new Exception("该部件不在设计里；请重新选择。");
+        if (o["structureBlueprintVuid"] == null) throw new Exception("该部件没有手工形状；请重新选择。");
+        // 车体和炮塔本体是设计里的根：拆成两条就变成两个本体，游戏读不回来。
+        if (Conversion.Id(o, "pvuid") < 0) throw new Exception("这是车体或炮塔本体：拆开会变成两个本体，只对附加部件可用。");
+        var blocks = b["blueprints"]!.AsArray();
+
+        if (Partner(objects, part) is int twin)
+        {
+            if (SharedShape(objects, blocks, part, twin)) PrivateShape(b, objects[twin]); // 各拿一份形状，改一边不再带动另一边
+            Unlink(o);
+            Unlink(objects[twin]);
+            return (b.ToJsonString(Indented), part, $"镜像对 {part} 与 {twin} 已断开：两侧成为独立部件，可单独编辑");
+        }
+        if (!Imaged(objects, part)) throw new Exception("该部件既不是镜像对的一半，也没有勾镜像显示：没有可拆的对应体。");
+
+        // The second side: the same record mirrored the way the game itself saves a pair (flip mark kept, no mirror link).
+        var added = Clone(o).AsObject();
+        int next = objects.Values.SelectMany(x => x.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && kv.Key is not ("pvuid" or "flags"))
+                                                    .Select(kv => kv.Value!.GetValue<int>())).DefaultIfEmpty(0).Max() + 1;
+        added["vuid"] = next++;
+        added["plateStructure"] = next++;
+        added["flags"] = o["flags"]!.GetValue<int>() & ~4;
+        added["transform"] = Clone(o["transform"]);
+        added["transform"]!["mirrorVuid"] = -1;
+        PrivateShape(b, added);
+        Conversion.WriteTransform(added["transform"]!.AsObject(), Flip * Conversion.Local(o["transform"]!) * Flip);
+        b["objects"]!.AsArray().Add(added);
+        Unlink(o);
+        return (b.ToJsonString(Indented), part,
+            $"部件 {part} 的镜像显示已拆成独立部件 {added["vuid"]!.GetValue<int>()}：两侧各拿一份形状，可单独编辑");
+    }
+
+    /// QoL 的“镜像侧变实体”：镜像对拆成两个各自有形状的部件；单记录镜像侧的新件连同它上面的附加件都变成真件，
+    /// 每个各拿一份形状，位置不变。比早期 `DetachMirror` 多处理“镜像侧上挂着的附加件”。
+    public static EditPlan PlanRealMirror(string json, int part, LiveShapes? live = null)
+    {
+        var b = Conversion.Parse(json);
+        var objects = Conversion.Objects(b);
+        if (!objects.TryGetValue(part, out var o) || Conversion.GuidOf(o) != Conversion.AddonGuid)
+            throw new Exception("请选择一个镜像附加件：把它的镜像侧变成独立附加件。");
+        var blocks = b["blueprints"]!.AsArray();
+        var meshes = b["meshes"]!.AsArray();
+        var before = Conversion.WorldMatrices(objects);
+        var place = Placement(objects, before, live);
+        var imageAt = place.ImageAt;
+        var made = new Dictionary<int, Matrix4x4>();
+        string summary;
+        if (o["transform"]?["mirrorVuid"] is JsonValue mv && mv.TryGetValue<int>(out int twin) && twin != part && objects.TryGetValue(twin, out var other))
+        {
+            var shown = new[] { part, twin }.ToDictionary(v => v, v => place.At(v));
+            Unlink(o);
+            Unlink(other);
+            foreach (int v in new[] { part, twin })
+            {
+                var (_, meshData) = OwnMesh(b, objects, new[] { v }, "需要先有自己的形状");
+                if (shown[v].GetDeterminant() >= 0) continue;
+                MirrorShape(meshData);
+                objects[v]["flags"] = (objects[v]["flags"]?.GetValue<int>() ?? 0) & ~1;
+            }
+            summary = $"部件 {part} 和 {twin} 不再是镜像对；两侧各有一份自己的形状。";
+        }
+        else if (Imaged(objects, part))
+        {
+            var frames = Conversion.WorldMatrices(objects, attachmentFrames: true);
+            int next = NextPartId(objects);
+            void Real(int v, int parent, Matrix4x4 frame)
+            {
+                var source = objects[v];
+                var image = imageAt(v);
+                if (!Matrix4x4.Invert(frame, out var intoParent)) throw new Exception($"无法反转部件 {parent} 的变换。");
+                var block = Clone(Block(blocks, Conversion.Id(source, "structureBlueprintVuid"))).AsObject();
+                int blockId = NextId(blocks, "id"), meshId = NextId(meshes, "vuid"), vuid = next;
+                var mesh = Clone(meshes.First(m => m!["vuid"]!.GetValue<int>() == Conversion.Id(block["blueprint"]!, "bodyMeshVuid"))).AsObject();
+                block["id"] = blockId;
+                block["blueprint"]!["bodyMeshVuid"] = meshId;
+                mesh["vuid"] = meshId;
+                blocks.Add(block);
+                meshes.Add(mesh);
+                bool mirrored = image.GetDeterminant() < 0;
+                if (mirrored) MirrorShape(mesh["meshData"]!.AsObject());
+                var w = mirrored ? Flip * image : image;
+                var copy = Clone(source).AsObject();
+                copy["vuid"] = vuid;
+                copy["plateStructure"] = vuid + 1;
+                next += 2;
+                copy["pvuid"] = parent;
+                copy["flags"] = (source["flags"]?.GetValue<int>() ?? 0) & ~5;
+                copy["structureBlueprintVuid"] = blockId;
+                copy["transform"]!["mirrorVuid"] = -1;
+                Conversion.WriteTransform(copy["transform"]!.AsObject(), w * intoParent);
+                b["objects"]!.AsArray().Add(copy);
+                Unlink(source);
+                made[vuid] = mirrored ? Flip * image : image;
+                foreach (int child in objects.Where(kv => kv.Value["pvuid"]?.GetValue<int>() == v && Conversion.GuidOf(kv.Value) == Conversion.AddonGuid
+                                                          && kv.Value["structureBlueprintVuid"] != null && Imaged(objects, kv.Key)).Select(kv => kv.Key).ToList())
+                    Real(child, vuid, w);
+            }
+            int parentOf = Conversion.Id(o, "pvuid");
+            Real(part, parentOf, parentOf < 0 ? Matrix4x4.Identity : frames[parentOf]);
+            summary = $"部件 {part} 的镜像侧现在是独立附加件 {made.Keys.First()}{(made.Count > 1 ? $"，连同它上面的 {made.Count - 1} 个附加件" : "")}，各有一份自己的形状。";
+        }
+        else throw new Exception("这个附加件没有镜像侧可变成实体。");
+        var all = Conversion.Objects(b);
+        var after = Conversion.WorldMatrices(all);
+        foreach (var (id, matrix) in before)
+            if (!Conversion.Near(after[id], matrix)) throw new Exception($"部件 {id} 会移动，未作修改。");
+        foreach (var (id, image) in made)
+            if (!Conversion.Near(Shape(all[id], after[id]), image)) throw new Exception("新附加件不会出现在镜像侧原来的位置，未作修改。");
+        return new EditPlan(b.ToJsonString(Indented), new(), new(), new(), new(), false, made.Count > 0 ? made.Keys.First() : part, summary);
+    }
+
+    /// Blender 的“原点到几何中心”：把部件（以及镜像对侧）的原点移到形状包围盒中心。
+    /// 形状留在原处（点反向移动），挂在它下面的部件也跟着补偿，所以外观不动。
+    public static EditPlan PlanOrigin(string json, int part)
+    {
+        var b = Conversion.Parse(json);
+        var objects = Conversion.Objects(b);
+        if (!objects.TryGetValue(part, out var o) || o["structureBlueprintVuid"] == null || o.ContainsKey("mantlet"))
+            throw new Exception("只有手工形状的部件（附加部件、车体或炮塔）才有可移动的原点。");
+        var before = Conversion.WorldMatrices(objects);
+        var group = Twin(objects, b["blueprints"]!.AsArray(), before, part) is int twin ? new[] { part, twin } : new[] { part };
+        var (structures, meshData) = OwnMesh(b, objects, group, "需要先有自己的形状");
+        var raw = meshData["mesh"]!["vertices"]!.AsArray();
+        var p = raw.Select(x => MeshCut.F(x)).ToArray();
+        if (p.Length < 3) throw new Exception("这个形状没有点。");
+        Vector3 min = new(float.MaxValue), max = new(float.MinValue);
+        for (int i = 0; i + 2 < p.Length; i += 3)
+        {
+            min = Vector3.Min(min, new(p[i], p[i + 1], p[i + 2]));
+            max = Vector3.Max(max, new(p[i], p[i + 1], p[i + 2]));
+        }
+        var c = (min + max) / 2;
+        if (c.Length() < 1e-4f) throw new Exception("原点已经在形状中心。");
+        for (int i = 0; i + 2 < p.Length; i += 3)
+        {
+            raw[i] = p[i] - c.X;
+            raw[i + 1] = p[i + 1] - c.Y;
+            raw[i + 2] = p[i + 2] - c.Z;
+        }
+        foreach (int v in group)
+        {
+            var shift = Vector3.Transform(c, Shape(objects[v], Matrix4x4.Identity)); // 翻转件沿自身 x 镜像显示
+            var t = objects[v]["transform"]!.AsObject();
+            Conversion.WriteTransform(t, Matrix4x4.CreateTranslation(shift) * Conversion.Local(t));
+            foreach (var child in objects.Values.Where(x => x["pvuid"]?.GetValue<int>() == v))
+            {
+                var ct = child["transform"]!.AsObject();
+                Conversion.WriteTransform(ct, Conversion.Local(ct) * Matrix4x4.CreateTranslation(-shift));
+            }
+        }
+        // 外观不许动：其他部件留在原处，形状也留在原处。
+        var after = Conversion.WorldMatrices(Conversion.Objects(b));
+        foreach (var (id, matrix) in after)
+            if (group.Contains(id)
+                    ? !Conversion.Near(Matrix4x4.CreateTranslation(-c) * Shape(objects[id], matrix), Shape(objects[id], before[id]))
+                    : !Conversion.Near(matrix, before[id]))
+                throw new Exception($"部件 {id} 会移动，原点未改。");
+        var meshId = Conversion.Id(structures[0], "bodyMeshVuid");
+        int faces = meshData["mesh"]!["faces"]!.AsArray().Count;
+        return new EditPlan(b.ToJsonString(Indented), group.ToDictionary(v => v, _ => meshId), group.ToDictionary(v => v, _ => faces), new(), new(), false, part,
+            $"部件 {string.Join(" 和镜像侧 ", group)} 的原点已移到形状中心（{c.Length() * 1000:0} 毫米）。");
+    }
+
+    /// A record stops sharing its settings block and its shape: it gets a copy of both, so editing this side no longer
+    /// edits the side that used to point at the same numbers (mirror twins are saved as one block and one mesh).
+    static void PrivateShape(JsonObject b, JsonObject o)
+    {
+        var blocks = b["blueprints"]!.AsArray();
+        var meshes = b["meshes"]!.AsArray();
+        var block = Clone(Block(blocks, Conversion.Id(o, "structureBlueprintVuid"))).AsObject();
+        int meshId = Conversion.Id(block["blueprint"]!, "bodyMeshVuid");
+        if (MeshOf(meshes, meshId)?["mesh"] is not JsonObject) throw new Exception("该部件不是手工（自由形式）形状：拆不成独立件。");
+        block["id"] = NextId(blocks, "id");
+        var entry = Clone(meshes.First(m => m!["vuid"]!.GetValue<int>() == meshId)).AsObject();
+        entry["vuid"] = NextId(meshes, "vuid");
+        block["blueprint"]!["bodyMeshVuid"] = JsonValue.Create(entry["vuid"]!.GetValue<int>()); // 新值，不能把 entry 底下的节点搬走
+        blocks.Add(block);
+        meshes.Add(entry);
+        o["structureBlueprintVuid"] = block["id"]!.GetValue<int>();
     }
 
     /// Face count of every part's hand-made shape in a design (parts without one are left out).
@@ -246,6 +468,13 @@ public static class AddonEdits
             }
         }
 
+        // 游戏用一个件里的 16 位计数来记点／边／面／角数：超了存进去也读不回来（设计打不开），于是合并像是「静默没生效」。
+        // 玩家日志 2026-10-11：11,200 面并进 14,300 面每次都失败，并进 4,400 面可以。序列化前先数一遍，超了就明确拒绝。
+        int points = into["vertices"]!.AsArray().Count / 3, edges = into["edges"]!.AsArray().Count / 2, faces = into["faces"]!.AsArray().Count;
+        int corners = into["faces"]!.AsArray().Sum(f => f!["v"]!.AsArray().Count);
+        if (Math.Max(Math.Max(points, edges), Math.Max(faces, corners)) > ushort.MaxValue)
+            throw new Exception($"合并后的附加部件会有 {faces:N0} 个面（{corners:N0} 个角点、{points:N0} 个点）；游戏一个件最多存 65,535 个。" +
+                "少并几个件到这个件上，或者并到更小的件上去。");
         RemoveParts(b, objects, gone);
         var after = Conversion.WorldMatrices(Conversion.Objects(b));
         foreach (var (id, matrix) in after)
@@ -357,6 +586,219 @@ public static class AddonEdits
         return new EditPlan(b.ToJsonString(Indented), meshIds, oldFaces, remove, new(), inPlace, remove.Count > 0 ? meshIds.Keys.First() : cutter,
                            "Cut " + string.Join(", ", report) + "." + removed + differ(cutters.Concat(groups.SelectMany(g => g))));
     }
+
+    /// The most points a cloth sheet has (PlanDrape).
+    public const int MaxClothPoints = 4000;
+
+    /// What a drape lands on: every other shape, only the picked parts (with their mirror twins), or all but those.
+    public enum LandsOn { Everything, Only, AllBut }
+
+    /// How a cloth drapes: points `Cell` apart; `Hole` the share of each cell left open, a net's mesh (0: solid cloth);
+    /// `Stiffness` how hard it resists bending (0.15 drapes like canvas); what it lands on, `Parts` being the picked parts.
+    public sealed record DrapeOptions(float Cell = 0.1f, float Hole = 0, float Stiffness = 0.15f, LandsOn LandsOn = LandsOn.Everything, IReadOnlyCollection<int>? Parts = null);
+
+    /// Blender's cloth drape: add-on `part` becomes a sheet of cloth as wide and long as its top, points `Cell` apart,
+    /// dropped from there onto the vehicle's other shapes until it settles (Cloth.Drape). The shape it settles in is the
+    /// add-on's new shape: one thin sheet (at most 10 mm, the add-on's own thickness if less), or a net with a hole in
+    /// every cell. It goes no lower than the lowest thing it can land on. Parts the design has no shape for (hatches,
+    /// periscopes, wheels, tracks) catch it as `boxes` (DesignEditor.PartBoxes, by part; none offline).
+    public static EditPlan PlanDrape(string json, int part, DrapeOptions? options = null, LiveShapes? live = null,
+                                     IReadOnlyDictionary<int, List<(Vector3 A, Vector3 B, Vector3 C)>>? boxes = null)
+    {
+        var how = options ?? new DrapeOptions();
+        var b = Conversion.Parse(json);
+        var objects = Conversion.Objects(b);
+        if (!objects.TryGetValue(part, out var o) || Conversion.GuidOf(o) != Conversion.AddonGuid) throw new Exception("Only an add-on can become cloth; select one.");
+        var blocks = b["blueprints"]!.AsArray();
+        var meshes = b["meshes"]!.AsArray();
+        var before = Conversion.WorldMatrices(objects);
+        var group = Twin(objects, blocks, before, part) is int twin ? new[] { part, twin } : new[] { part };
+        var (At, ImageAt, _) = Placement(objects, before, live);
+        var picked = (how.Parts ?? System.Array.Empty<int>()).Where(objects.ContainsKey)
+            .SelectMany(v => Twin(objects, blocks, before, v) is int t ? new[] { v, t } : new[] { v }).ToHashSet();
+
+        // What it lands on: the other hand-made shapes, where they show, each face outward (a mirrored one winds the other way).
+        var solid = new List<(Vector3 A, Vector3 B, Vector3 C)>();
+        foreach (var (v, x) in objects)
+        {
+            if (group.Contains(v) || x["structureBlueprintVuid"] is not JsonValue id) continue;
+            if (how.LandsOn == LandsOn.Only ? !picked.Contains(v) : how.LandsOn == LandsOn.AllBut && picked.Contains(v)) continue;
+            if (MeshOf(meshes, Conversion.Id(Block(blocks, id.GetValue<int>())["blueprint"]!, "bodyMeshVuid"))?["mesh"] is not JsonObject mesh) continue;
+            var raw = mesh["vertices"]!.AsArray().Select(MeshCut.F).ToArray();
+            var faces = mesh["faces"]!.AsArray().Select(f => f!["v"]!.AsArray().Select(i => i!.GetValue<int>()).ToArray()).ToList();
+            foreach (var at in Imaged(objects, v) ? new[] { At(v), ImageAt(v) } : new[] { At(v) })
+            {
+                var w = Enumerable.Range(0, raw.Length / 3).Select(i => Vector3.Transform(new Vector3(raw[3 * i], raw[3 * i + 1], raw[3 * i + 2]), at)).ToArray();
+                bool mirrored = at.GetDeterminant() < 0;
+                bool open = OpenEdges(w, faces) > 0; // a plate, not a closed shape: no inside, so it stops the cloth from either side
+                foreach (var f in faces)
+                    for (int k = 1; k + 1 < f.Length; k++)
+                    {
+                        var (a, c, e) = mirrored ? (w[f[0]], w[f[k + 1]], w[f[k]]) : (w[f[0]], w[f[k]], w[f[k + 1]]);
+                        solid.Add((a, c, e));
+                        if (open) solid.Add((a, e, c));
+                    }
+            }
+        }
+        // Parts the design has no shape for (hatches, periscopes, lights, wheels, tracks), as boxes where the game shows them.
+        foreach (var (v, tris) in boxes ?? new Dictionary<int, List<(Vector3 A, Vector3 B, Vector3 C)>>())
+            if (!group.Contains(v) && !(how.LandsOn == LandsOn.Only ? !picked.Contains(v) : how.LandsOn == LandsOn.AllBut && picked.Contains(v)))
+                solid.AddRange(tris);
+        if (solid.Count == 0) throw new Exception(how.LandsOn == LandsOn.Only ? "None of the selected parts has a shape for the cloth to land on." : "There's nothing for the cloth to land on.");
+        float floor = solid.Min(t => Math.Min(t.A.Y, Math.Min(t.B.Y, t.C.Y)));
+
+        bool inPlace = OwnsMesh(objects, group);
+        var (structures, meshData) = OwnMesh(b, objects, group, "turned into cloth");
+        var blank = meshData["mesh"]!.AsObject();
+        int facesBefore = blank["faces"]!.AsArray().Count;
+        var p = blank["vertices"]!.AsArray().Select(MeshCut.F).ToArray();
+        Vector3 lo = new(float.MaxValue), hi = new(float.MinValue);
+        for (int i = 0; i + 2 < p.Length; i += 3) { lo = Vector3.Min(lo, new(p[i], p[i + 1], p[i + 2])); hi = Vector3.Max(hi, new(p[i], p[i + 1], p[i + 2])); }
+        int thickness = Math.Clamp((int)Math.Round(MeshCut.F(blank["faces"]?[0]?["t"]?[0])), 1, 10);
+        var shape = At(part);
+        if (!Matrix4x4.Invert(shape, out var intoShape)) throw new Exception("The add-on's transform can't be inverted.");
+        Vector3 Top(float x, float z) => Vector3.Transform(new Vector3(x, hi.Y, z), shape);
+        var corner = Top(lo.X, lo.Z);
+        var (across, along) = (Top(hi.X, lo.Z) - corner, Top(lo.X, hi.Z) - corner);
+        // The game counts a shape's face corners in 16 bits (see PlanMerge): 4 a cell, 16 for a net's 4 sides round its hole.
+        var size = Cloth.Size(across.Length(), along.Length(), how.Cell);
+        // shortcut: the drape runs on the game's main thread (about 2 µs a point per step, up to 900 steps), so the sheet is
+        // capped where the game stops for a few seconds at most; run Cloth.Drape off the main thread to allow finer sheets.
+        if (size.Columns * size.Rows > MaxClothPoints)
+            throw new Exception($"The cloth would have {size.Columns * size.Rows:N0} points; at most {MaxClothPoints:N0} drape without the game stopping for long. Space the points further apart (now {how.Cell * 100:0} cm) or drape a smaller add-on.");
+        int corners = (size.Columns - 1) * (size.Rows - 1) * (how.Hole > 0 ? 16 : 4);
+        if (corners > ushort.MaxValue)
+            throw new Exception($"The {(how.Hole > 0 ? "net" : "cloth")} would have {corners:N0} face corners; the game holds at most 65,535 in one part. Space the points further apart (now {how.Cell * 100:0} cm) or drape a smaller add-on.");
+        var draped = Cloth.Drape(corner, across, along, how.Cell, solid, floor, gap: 0.01f + thickness / 1000f, bend: how.Stiffness);
+
+        // The sheet's cells as quads, facing up as the sheet started: a cell (a, a+1, a+cols+1, a+cols) faces along
+        // across x along. A net's cell is 4 quads round a hole `Hole` as wide as the cell.
+        int cols = draped.Columns, rows = draped.Rows;
+        bool acrossAlongUp = Vector3.Cross(across, along).Y >= 0;
+        var local = draped.Points.Select(q => Vector3.Transform(q, intoShape)).ToList();
+        var quads = new List<int[]>();
+        for (int j = 0; j + 1 < rows; j++)
+            for (int i = 0; i + 1 < cols; i++)
+            {
+                int a = j * cols + i;
+                var cell = acrossAlongUp ? new[] { a, a + 1, a + cols + 1, a + cols } : new[] { a, a + cols, a + cols + 1, a + 1 };
+                if (how.Hole <= 0) { quads.Add(cell); continue; }
+                var mid = cell.Aggregate(Vector3.Zero, (s, k) => s + local[k]) / 4;
+                int inner = local.Count;
+                foreach (int k in cell) local.Add(mid + (local[k] - mid) * how.Hole);
+                for (int k = 0; k < 4; k++) quads.Add(new[] { cell[k], cell[(k + 1) % 4], inner + (k + 1) % 4, inner + k });
+            }
+        var fresh = MeshData(local, quads, thickness, 60);
+        foreach (string key in new[] { "mesh", "rivets", "smoothAngle" })
+        {
+            var node = fresh[key];
+            fresh.Remove(key);
+            meshData[key] = node;
+        }
+        double armour = quads.Sum(q => Area(local, q)) * thickness / 1000.0;
+        foreach (var s in structures) s["armourVolume"] = armour;
+        int meshId = Conversion.Id(structures[0], "bodyMeshVuid");
+        return new EditPlan(b.ToJsonString(Indented), group.ToDictionary(v => v, _ => meshId), group.ToDictionary(v => v, _ => facesBefore), new(), new(), inPlace, part,
+                            $"{(how.Hole > 0 ? "Net" : "Cloth")} of {cols} x {rows} points draped over part {string.Join(" and its twin ", group)} in {draped.Steps} steps{(draped.Settled ? "" : " (stopped before it fully settled)")}.");
+    }
+
+    /// 一次散落最多复制多少件。
+    public const int MaxScatter = 300;
+
+    /// Blender 的粒子散布：把选中的附加件（叶子、石头）复制 `count` 份，随机落在目标件的表面上，面积越大落得越多；
+    /// `upOnly` 只落在朝上的面。每份都像平放在地面上那样贴着该面，并绕面法线随机转向。相同 `seed` 得到相同散布。
+    public static EditPlan PlanScatter(string json, int target, IEnumerable<int> types, int count, int seed, bool upOnly, LiveShapes? live = null)
+    {
+        var b = Conversion.Parse(json);
+        var objects = Conversion.Objects(b);
+        var blocks = b["blueprints"]!.AsArray();
+        var meshes = b["meshes"]!.AsArray();
+        JsonObject? MeshOfPart(JsonObject x) => x["structureBlueprintVuid"] is JsonValue id
+            ? MeshOf(meshes, Conversion.Id(Block(blocks, id.GetValue<int>())["blueprint"]!, "bodyMeshVuid"))?["mesh"] as JsonObject : null;
+        if (!objects.TryGetValue(target, out var host) || MeshOfPart(host) is not JsonObject mesh)
+            throw new Exception("最后选要散落到的部件：附加件、车体或炮塔。");
+        var kinds = types.Distinct().Where(v => v != target && objects.TryGetValue(v, out var x) && Conversion.GuidOf(x) == Conversion.AddonGuid && MeshOfPart(x) != null).ToList();
+        if (kinds.Count == 0) throw new Exception("先选要散落的附加件（叶子、石头），最后选落到的部件。");
+        var world = Conversion.WorldMatrices(objects);
+        if (!Matrix4x4.Invert(Conversion.WorldMatrices(objects, attachmentFrames: true)[target], out var intoTarget)) throw new Exception("目标件的变换无法求逆。");
+        var at = Placement(objects, world, live).At;
+        var shape = at(target);
+
+        var raw = mesh["vertices"]!.AsArray().Select(MeshCut.F).ToArray();
+        var w = Enumerable.Range(0, raw.Length / 3).Select(i => Vector3.Transform(new Vector3(raw[3 * i], raw[3 * i + 1], raw[3 * i + 2]), shape)).ToArray();
+        bool mirrored = shape.GetDeterminant() < 0;
+        var tris = new List<(Vector3 A, Vector3 B, Vector3 C)>();
+        var areaTo = new List<double>();
+        double total = 0;
+        foreach (var f in mesh["faces"]!.AsArray().Select(x => x!["v"]!.AsArray().Select(i => i!.GetValue<int>()).ToArray()))
+            for (int k = 1; k + 1 < f.Length; k++)
+            {
+                var t = mirrored ? (w[f[0]], w[f[k + 1]], w[f[k]]) : (w[f[0]], w[f[k]], w[f[k + 1]]);
+                var n = Vector3.Cross(t.Item2 - t.Item1, t.Item3 - t.Item1);
+                if (n.Length() < 1e-9f || upOnly && n.Y < 0.3f * n.Length()) continue;
+                tris.Add(t);
+                areaTo.Add(total += n.Length() / 2);
+            }
+        if (tris.Count == 0) throw new Exception(upOnly ? "目标件没有朝上的面；关掉“只落在朝上的面”。" : "目标件没有可散落的面。");
+
+        var kind = kinds.Select(v =>
+        {
+            var turn = at(v);
+            turn.Translation = Vector3.Zero;
+            if (turn.GetDeterminant() < 0) turn = Flip * turn;
+            var m = MeshOfPart(objects[v])!;
+            var p = m["vertices"]!.AsArray().Select(MeshCut.F).ToArray();
+            float low = Enumerable.Range(0, p.Length / 3).Select(i => Vector3.Transform(new Vector3(p[3 * i], p[3 * i + 1], p[3 * i + 2]), turn).Y).DefaultIfEmpty(0).Min();
+            float thick = m["faces"]!.AsArray().SelectMany(x => x!["t"]!.AsArray().Select(MeshCut.F)).DefaultIfEmpty(0).Max() / 1000f;
+            return (Part: v, Turn: turn, Low: low - thick - 0.001f);
+        }).ToList();
+
+        var random = new Random(seed);
+        var list = b["objects"]!.AsArray();
+        int next = NextPartId(objects);
+        var planned = new Dictionary<int, Matrix4x4>();
+        count = Math.Clamp(count, 1, MaxScatter);
+        for (int c = 0; c < count; c++)
+        {
+            int hit = areaTo.BinarySearch(random.NextDouble() * total);
+            var (a, e, g) = tris[Math.Min(hit < 0 ? ~hit : hit, tris.Count - 1)];
+            float r = MathF.Sqrt((float)random.NextDouble()), s = (float)random.NextDouble();
+            var spot = a + (e - a) * (r * (1 - s)) + (g - a) * (r * s);
+            var up = Vector3.Normalize(Vector3.Cross(e - a, g - a));
+            var (type, turn, low) = kind[random.Next(kind.Count)];
+            var place = turn * Matrix4x4.CreateRotationY((float)(random.NextDouble() * 2 * Math.PI)) * Upright(up) * Matrix4x4.CreateTranslation(spot - up * low);
+            var copy = Clone(objects[type]).AsObject();
+            int vuid = next++;
+            copy["vuid"] = vuid;
+            copy["plateStructure"] = next++;
+            copy["pvuid"] = target;
+            copy["flags"] = (objects[type]["flags"]?.GetValue<int>() ?? 0) & ~5;
+            copy["transform"]!["mirrorVuid"] = -1;
+            Conversion.WriteTransform(copy["transform"]!.AsObject(), place * intoTarget);
+            list.Add(copy);
+            planned[vuid] = place;
+        }
+        var all = Conversion.Objects(b);
+        foreach (var (id, matrix) in Conversion.WorldMatrices(all))
+            if (planned.TryGetValue(id, out var want) ? !Conversion.Near(Shape(all[id], matrix), want) : !Conversion.Near(matrix, world[id]))
+                throw new Exception($"部件 {id} 不会出现在计划的位置；没有散落。");
+        return new EditPlan(b.ToJsonString(Indented), new(), new(), new(), new(), false, target,
+                            $"已在部件 {target} 上散落 {count} 份、共 {kinds.Count} 种附加件。");
+    }
+
+    /// 把 +y 转到单位方向 `n` 的旋转。
+    internal static Matrix4x4 Upright(Vector3 n)
+    {
+        var up = Vector3.Normalize(n);
+        var side = Vector3.Normalize(Vector3.Cross(MathF.Abs(up.Y) > 0.99f ? Vector3.UnitZ : Vector3.UnitY, up));
+        var fwd = Vector3.Cross(up, side);
+        return new Matrix4x4(side.X, up.X, fwd.X, 0, side.Y, up.Y, fwd.Y, 0, side.Z, up.Z, fwd.Z, 0, 0, 0, 0, 1);
+    }
+
+    /// 比所有部件编号都大的新编号。
+    static int NextPartId(Dictionary<int, JsonObject> objects) =>
+        objects.Values.SelectMany(o => o.Where(kv => kv.Value is JsonValue v && v.TryGetValue<int>(out _) && kv.Key is not ("pvuid" or "flags"))
+                                         .Select(kv => kv.Value!.GetValue<int>())).DefaultIfEmpty(0).Max() + 1;
 
     /// Where shapes show: as the running game reports (when it did), else by the design's maths (a flipped part mirrored
     /// along its own x; an image reflected across the centre). The third function names parts where the two disagree, for

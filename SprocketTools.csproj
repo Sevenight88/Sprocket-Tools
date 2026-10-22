@@ -4,8 +4,8 @@
     <TargetFramework>net6.0</TargetFramework>
     <AssemblyName>SprocketTools</AssemblyName>
     <RootNamespace>SprocketTools</RootNamespace>
-    <Version>1.0.2</Version>
-    <Description>SprocketTools：上游 Quality of Life 1.8.1 的中文分叉，界面、提示与出图文字直接写中文。</Description>
+    <Version>1.3.0</Version>
+    <Description>SprocketTools：上游 Quality of Life 1.8.3 的中文分叉，界面、提示与出图文字直接写中文。</Description>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -24,6 +24,12 @@
     <Reference Include="libs\0Harmony.dll"><Private>false</Private></Reference>
     <Reference Include="libs\Il2CppInterop.Runtime.dll"><Private>false</Private></Reference>
     <Reference Include="$(GameDir)\BepInEx\interop\*.dll"><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <!-- 自造装甲材质：七份科技 json 随 DLL 内嵌，运行时落地到 BepInEx\plugins\SprocketMaterials\，
+       资源名是 SprocketTools.Materials.<文件>.json。这样材质条目跟 DLL 同进退，不用另发数据目录。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="Materials\*.json" />
   </ItemGroup>
 
   <Target Name="CheckSprocketGameDir" BeforeTargets="ResolveAssemblyReferences"

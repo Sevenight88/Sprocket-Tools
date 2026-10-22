@@ -1,5 +1,6 @@
 using HarmonyLib;
 using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.InteropTypes;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Sprocket.MeshEditing;
 using Sprocket.PartImporting;
@@ -26,7 +27,9 @@ public static class MeshTools
 
     // The game's Delete operation, given nothing to delete, carries a tool so it gets the game's undo and mesh rebuild.
     // Only these instances run a tool; every other Delete runs as normal.
-    static readonly Dictionary<IntPtr, (DeleteOp Op, string Name, Func<EditMesh, (bool Done, string Message)> Apply)> ours = new();
+    // Topology/Original 是回滚用的两把把手：游戏给撤销做快照前，出错的那个 EditMesh 必须换回没动过的那一个。
+    static readonly Dictionary<IntPtr, (DeleteOp Op, string Name, Func<EditMesh, (bool Done, string Message)> Apply,
+        MeshTopologyEditOp Topology, EditMesh Original)> ours = new();
     static readonly Dictionary<IntPtr, IntPtr> carriedTools = new();
     static PlateStructureEditOperations? notify;
 
@@ -34,40 +37,32 @@ public static class MeshTools
     static bool Intercept(DeleteOp __instance, EditMesh mesh)
     {
         if (!ours.TryGetValue(__instance.Pointer, out var tool)) return true;
-        Ui.Guard(tool.Name, () =>
+        try
         {
-            Probe(mesh, tool.Name + " 改前"); // 一次性诊断，查完删
             var (done, message) = tool.Apply(mesh);
+            // 收尾前把整张表连一遍：连接断了却"成功"的编辑，会到下一次编辑或存盘时才炸。
+            if (CloneProblem(mesh) is string problem) throw new InvalidOperationException(problem);
             Plugin.ModLog.LogInfo($"{tool.Name}: {message}");
             if (!done) notify?.NotifyError($"{tool.Name}: {message}");
-            else Probe(mesh, tool.Name + " 改后");
-        });
+        }
+        catch (Exception ex)
+        {
+            // IL2CPP 的 Harmony 跳板只记日志、不托管异常，所以抛出去并不能中止这笔事务。
+            // 必须亲手把没动过的原网格接回去，并让撤销栈指向这个有效版本而不是眼前这个半成品。
+            Restore(tool.Topology, tool.Original);
+            Plugin.ModLog.LogError($"{tool.Name}: 编辑已取消，原网格已恢复。{ex}");
+            notify?.NotifyError(tool.Name + "：编辑已取消，原形状已恢复");
+        }
         return false;
     }
 
-    /// 一次性诊断，查完就删：分割/合并之后，游戏给撤销做快照时数组越界（TessellatedMesh.Combine、Duplication.Clone）。
-    /// 把"计数属性"和"列表实长"、还挂着 Delete 标记的元素、以及每类元素的最大 index 都打出来，看是哪一对不上。
-    static void Probe(EditMesh mesh, string tool) => Ui.Guard("Mesh probe", () =>
+    /// 一笔网格编辑失败时唯一的收场：把快照里的原网格放回 final、Revert 掉已做的改动、标脏重建。
+    internal static void Restore(MeshTopologyEditOp topology, EditMesh original) => Ui.Guard("Mesh edit rollback", () =>
     {
-        var (v, vd, vm) = Elements(mesh.vertices);
-        var (e, ed, em) = Elements(mesh.edges);
-        var (f, fd, fm) = Elements(mesh.faces);
-        int loops = mesh.loops.Count, loopMax = -1;
-        for (int i = 0; i < loops; i++) loopMax = Math.Max(loopMax, mesh.loops[i].index);
-        Plugin.ModLog.LogInfo($"TOOL_PROBE {tool}: 列表 {v}/{e}/{f}/{loops} 属性 {mesh.VertexCount}/{mesh.EdgeCount}/{mesh.FaceCount}/{mesh.LoopCount} " +
-            $"待删 {vd}/{ed}/{fd} 最大index {vm}/{em}/{fm}/{loopMax} loopNormals {(mesh.loopNormals?.Length ?? -1)}");
+        topology.final = original;
+        topology.Revert(topology.context);
+        original.MarkDirty(MeshDirtyFlags.All);
     });
-
-    static (int count, int marked, int highest) Elements<T>(Il2CppSystem.Collections.Generic.List<T> items) where T : Element
-    {
-        int marked = 0, highest = -1;
-        for (int i = 0; i < items.Count; i++)
-        {
-            if (items[i].HasFlag(ElementFlags.Delete)) marked++;
-            highest = Math.Max(highest, items[i].index);
-        }
-        return (items.Count, marked, highest);
-    }
 
     internal static void Run(PlateStructureEditor editor, string name, Func<EditMesh, (bool, string)> apply) => Ui.Guard(name, () =>
     {
@@ -78,21 +73,38 @@ public static class MeshTools
             return;
         }
         var op = new DeleteOp(DeleteType.None) { Name = name };
-        ours[op.Pointer] = (op, name, apply);
+        var meshEditor = editor.meshEditor;
+        var currentMesh = meshEditor?.Mesh?.EditMesh;
+        if (currentMesh == null || meshEditor == null) return;
+        // 动手前先确认这张表自己是完好的：坏表上再做一笔，报错会落在下一笔工具上，查不到真凶。
+        RepairThickening(currentMesh);
+        if (CloneProblem(currentMesh) is string problem)
+        {
+            editor.operations.NotifyError(name + "：" + problem);
+            Plugin.ModLog.LogError(name + "：" + problem);
+            return;
+        }
+        var topology = meshEditor.CreateTopoOp(op);
+        ours[op.Pointer] = (op, name, apply, topology, currentMesh);
         var ops = notify = editor.operations;
         bool retained = false;
         try
         {
-            var carried = ops.Execute(editor.meshEditor.CreateTopoOp(op), StructureEditOperationOptions.None, ops.GetNewGroupID());
+            var carried = ops.Execute(topology, StructureEditOperationOptions.None, ops.GetNewGroupID());
             if (carried?.operation is { } historyOp)
             {
                 carriedTools[historyOp.Pointer] = op.Pointer;
                 retained = true;
             }
             else ours.Remove(op.Pointer);
-            editor.meshEditor.SelectFlush();
+            meshEditor.SelectFlush();
         }
-        catch { if (!retained) ours.Remove(op.Pointer); throw; }
+        catch
+        {
+            Restore(topology, currentMesh);
+            if (!retained) ours.Remove(op.Pointer);
+            throw;
+        }
         finally { notify = null; }
     });
 
@@ -265,12 +277,7 @@ public static class MeshTools
             for (int k = 0; k < face.vertexCount; k++, l = l.next)
             {
                 var from = From(source, ids[l.vertex.Pointer]);
-                l.thickenMode = from.thickenMode;
-                // A corner thickens along an edge from its own point; a new point can't use the one its source point had
-                // (the game's check: LoopVertexNotInThickenEdge), so the game picks one for it.
-                var edge = from.thickenEdge;
-                l.thickenEdge = edge != null && (edge.v0.Pointer == l.vertex.Pointer || edge.v1.Pointer == l.vertex.Pointer) ? edge : null;
-                if (l.thickenEdge == null && l.thickenMode == ThickenMode.AlongEdgeManual) l.thickenMode = ThickenMode.AlongEdgeAuto;
+                CopyThickening(l, from);
             }
         }
         var (kept, lost) = rivets.Place(made.Select(m => m.Face), reach: 0.05f);
@@ -332,27 +339,138 @@ public static class MeshTools
         }
     }
 
-    /// A corner thickening along an edge being deleted lets the game pick instead; then the marked parts go.
+    /// 把来源角的加厚设置搬到新角：新点不能沿用来源点那条加厚边（游戏的判据是 LoopVertexNotInThickenEdge），
+    /// 所以边必须真的含这个新点，否则交给游戏自己挑（AlongEdgeManual 退回 AlongEdgeAuto）。
+    internal static void CopyThickening(Loop destination, Loop source)
+    {
+        destination.thickenMode = source.thickenMode;
+        var edge = source.thickenEdge;
+        destination.thickenEdge = edge != null && !edge.HasFlag(ElementFlags.Delete) &&
+            (edge.v0.Pointer == destination.vertex.Pointer || edge.v1.Pointer == destination.vertex.Pointer) ? edge : null;
+        if (destination.thickenEdge == null && destination.thickenMode == ThickenMode.AlongEdgeManual)
+            destination.thickenMode = ThickenMode.AlongEdgeAuto;
+    }
+
+    /// 删掉标记过的元素。原来这里只做 DeleteMarked()，而 DeleteMarked 只压缩列表——被删的边/面还挂在某个点的
+    /// disk 环、某条边的 radial 环里，索引被回收后下一笔编辑或游戏给撤销做快照（Duplication.Clone）时就越界。
+    /// 所以先把计划标记清掉，再让游戏自己的删除助手逐个执行（它们会先解连接、再自己打标记），最后才压缩。
     internal static int FinishDelete(EditMesh mesh)
     {
+        var faces = MarkedForDelete(mesh.faces);
+        var edges = MarkedForDelete(mesh.edges);
+        var vertices = MarkedForDelete(mesh.vertices);
+        var deletedEdges = edges.Select(e => e.Pointer).ToHashSet();
+        var deletedVertices = vertices.Select(v => v.Pointer).ToHashSet();
+        // 幸存边指着要删的点：这已经是坏表，删下去只会把坏结果带进撤销栈。
+        foreach (var edge in mesh.edges)
+            if (!deletedEdges.Contains(edge.Pointer) && (deletedVertices.Contains(edge.v0.Pointer) || deletedVertices.Contains(edge.v1.Pointer)))
+                throw new InvalidOperationException("有要被删除的点还连着一条要保留的边");
+        foreach (var face in faces) face.DisableFlag(ElementFlags.Delete);
+        foreach (var edge in edges) edge.DisableFlag(ElementFlags.Delete);
+        foreach (var vertex in vertices) vertex.DisableFlag(ElementFlags.Delete);
+        foreach (var face in faces) Delete.DeleteFace(mesh, face);
+        foreach (var edge in edges) Delete.DeleteEdge(mesh, edge);
+        foreach (var vertex in vertices) Delete.DeleteVertex(mesh, vertex);
+        int repointed = RepairThickening(mesh);
+        mesh.DeleteMarked();
+        repointed += RepairThickening(mesh);
+        mesh.MarkDirty(MeshDirtyFlags.All);
+        if (CloneProblem(mesh) is string problem) throw new InvalidOperationException(problem);
+        return repointed;
+    }
+
+    /// 带着删除标记的元素。名字要跟上头那个只数 Selected 的 Marked 区分开：一个是「待删清单」，一个是「选中个数」。
+    static List<T> MarkedForDelete<T>(Il2CppSystem.Collections.Generic.List<T> items) where T : Element =>
+        Enumerable.Range(0, items.Count).Select(i => items[i]).Where(e => e.HasFlag(ElementFlags.Delete)).ToList();
+
+    /// 幸存角的加厚边只剩"真的还属于这个点、而且还在边表里"的那些。判据用指针归属，不用会被回收的 index。
+    internal static int RepairThickening(EditMesh mesh)
+    {
+        var edges = Enumerable.Range(0, mesh.edges.Count).Select(i => mesh.edges[i])
+            .Where(e => !e.HasFlag(ElementFlags.Delete)).Select(e => e.Pointer).ToHashSet();
         int repointed = 0;
-        var faces = mesh.faces;
-        for (int i = 0; i < faces.Count; i++)
+        foreach (var face in mesh.faces)
         {
-            if (faces[i].HasFlag(ElementFlags.Delete)) continue;
-            var l = faces[i].firstLoop;
-            for (int k = 0; k < faces[i].vertexCount; k++, l = l.next)
-                if (l.thickenEdge != null && l.thickenEdge.HasFlag(ElementFlags.Delete))
+            if (face.HasFlag(ElementFlags.Delete)) continue;
+            var l = face.firstLoop;
+            for (int k = 0; k < face.vertexCount && l != null; k++, l = l.next)
+                if (l.thickenEdge is { } edge && (!edges.Contains(edge.Pointer) || l.vertex == null ||
+                    edge.v0 == null || edge.v1 == null || !edge.ContainsVertex(l.vertex)))
                 {
                     l.thickenEdge = null;
                     if (l.thickenMode == ThickenMode.AlongEdgeManual) l.thickenMode = ThickenMode.AlongEdgeAuto;
                     repointed++;
                 }
         }
-        mesh.DeleteMarked();
-        mesh.MarkDirty(MeshDirtyFlags.All);
+        if (repointed > 0) mesh.MarkDirty(MeshDirtyFlags.All);
         return repointed;
     }
+
+    /// 整张表的连接体检：游戏自带的 Face.Validate 只看链接在不在，看不见"已删的边还挂在 disk 环里"这类问题，
+    /// 而原生 Clone 假定每个被引用的元素都还在这些表里、每个面只有三角或四边。返回 null 才算完好，
+    /// 否则返回一句能直接给玩家看的原因。动手前与重建后各查一遍。
+    internal static string? CloneProblem(EditMesh mesh)
+    {
+        var vertices = Pointers(mesh.vertices);
+        var edges = Pointers(mesh.edges);
+        var faces = Pointers(mesh.faces);
+        var loops = Pointers(mesh.loops);
+        if (vertices.Count != mesh.vertices.Count || edges.Count != mesh.edges.Count ||
+            faces.Count != mesh.faces.Count || loops.Count != mesh.loops.Count)
+            return "网格里有重复的元素引用";
+        if (vertices.Count > ushort.MaxValue || edges.Count > ushort.MaxValue ||
+            faces.Count > ushort.MaxValue || loops.Count > ushort.MaxValue)
+            return "网格超出了游戏单件 65,535 元素的上下限";
+
+        foreach (var edge in mesh.edges)
+        {
+            if (edge.v0 == null || edge.v1 == null || !vertices.Contains(edge.v0.Pointer) || !vertices.Contains(edge.v1.Pointer))
+                return "有一条边指着已经不在网格里的点";
+            foreach (var vertex in new[] { edge.v0, edge.v1 })
+            {
+                var next = edge.GetNextDiskEdge(vertex);
+                var prev = edge.GetPreviousDiskEdge(vertex);
+                if (next == null || prev == null || !edges.Contains(next.Pointer) || !edges.Contains(prev.Pointer) ||
+                    !next.ContainsVertex(vertex) || !prev.ContainsVertex(vertex) ||
+                    next.GetPreviousDiskEdge(vertex)?.Pointer != edge.Pointer || prev.GetNextDiskEdge(vertex)?.Pointer != edge.Pointer)
+                    return "有一条边和它的点没有正确相连";
+            }
+            if (edge.loop != null && (!loops.Contains(edge.loop.Pointer) || edge.loop.edge?.Pointer != edge.Pointer))
+                return "有一条边指着已经不在网格里的角";
+        }
+        foreach (var vertex in mesh.vertices)
+            if (vertex.firstEdge != null && (!edges.Contains(vertex.firstEdge.Pointer) || !vertex.firstEdge.ContainsVertex(vertex)))
+                return "有一个点指着已经不在网格里的边";
+
+        var usedLoops = new HashSet<IntPtr>();
+        foreach (var face in mesh.faces)
+        {
+            if (face.vertexCount is < 3 or > 4) return "游戏要求每个面只能是三角形或四边形";
+            var first = face.firstLoop;
+            var loop = first;
+            for (int k = 0; k < face.vertexCount; k++, loop = loop!.next)
+            {
+                if (loop == null || !loops.Contains(loop.Pointer) || !usedLoops.Add(loop.Pointer) || loop.face?.Pointer != face.Pointer ||
+                    loop.vertex == null || !vertices.Contains(loop.vertex.Pointer) || loop.edge == null || !edges.Contains(loop.edge.Pointer))
+                    return "有一个面引用了缺失或被共用的角、点或边";
+                if (loop.next == null || loop.prev == null || loop.next.prev?.Pointer != loop.Pointer || loop.prev.next?.Pointer != loop.Pointer ||
+                    loop.next.vertex == null || !loop.edge.ContainsVertices(loop.vertex, loop.next.vertex))
+                    return "有一个面的角没有正确相连";
+                if (loop.radialNext == null || loop.radialPrev == null ||
+                    !loops.Contains(loop.radialNext.Pointer) || !loops.Contains(loop.radialPrev.Pointer) ||
+                    loop.radialNext.edge?.Pointer != loop.edge.Pointer || loop.radialPrev.edge?.Pointer != loop.edge.Pointer ||
+                    loop.radialNext.radialPrev?.Pointer != loop.Pointer || loop.radialPrev.radialNext?.Pointer != loop.Pointer)
+                    return "有一个角和它所在的边没有正确相连";
+                if (loop.thickenEdge != null && (!edges.Contains(loop.thickenEdge.Pointer) || !loop.thickenEdge.ContainsVertex(loop.vertex)))
+                    return "有一个角的加厚边已经不属于它的点了";
+            }
+            if (loop?.Pointer != first?.Pointer) return "有一个面的角环没有闭合";
+        }
+        return usedLoops.SetEquals(loops) ? null : "网格里有不属于任何面的角";
+    }
+
+    static HashSet<IntPtr> Pointers<T>(Il2CppSystem.Collections.Generic.List<T> items) where T : Il2CppObjectBase =>
+        Enumerable.Range(0, items.Count).Select(i => items[i].Pointer).ToHashSet();
 
     // ---------- the tools ----------
 
@@ -429,6 +547,12 @@ public static class MeshTools
             return Apply(mesh, v, MeshPlans.Bevel(v.Pos, v.Corners, WithTwins(v, v.SelectedEdges, mirror), width), "bevel", preserveBevelEdges: true);
         });
     }
+
+    internal static void MenuSmoothEdge(PlateStructureEditor e) => SmoothEdge(e);
+    internal static void MenuFillet(PlateStructureEditor e) => Fillet(e);
+    internal static void MenuBridge(PlateStructureEditor e) => Bridge(e);
+    internal static void MenuCircle(PlateStructureEditor e) => Circle(e);
+    internal static void MenuFixMirror(PlateStructureEditor e) => FixMirror(e);
 
     static void SmoothEdge(PlateStructureEditor e)
     {
@@ -714,30 +838,34 @@ public static class MeshTools
         var e = Hotkeys.Current;
         if (e != null && halfGrid) KeepHalfGrid(e);
         bool ctrl = keys.ctrlKey.isPressed;
-        if (keys.f5Key.wasPressedThisFrame) ToggleShadows();
-        if (keys.f6Key.wasPressedThisFrame) ToggleFlashlight();
-        if (keys.f7Key.wasPressedThisFrame) ToggleFullbright();
+        if (Keybinds.Pressed("shadows")) ToggleShadows();
+        if (Keybinds.Pressed("flashlight")) ToggleFlashlight();
+        if (Keybinds.Pressed("fullbright")) ToggleFullbright();
         AimFlashlight();
         PlaceFills();
         PlaceHeadlight();
-        if (keys.numpad1Key.wasPressedThisFrame) LookFrom(ctrl ? Vector3.forward : Vector3.back);   // front (Ctrl: back)
-        if (keys.numpad3Key.wasPressedThisFrame) LookFrom(ctrl ? Vector3.right : Vector3.left);     // right side (Ctrl: left)
-        if (keys.numpad7Key.wasPressedThisFrame) LookFrom(ctrl ? Vector3.up : Vector3.down);         // top (Ctrl: from below)
-        if (keys.numpad9Key.wasPressedThisFrame) LookFrom(-(held ?? shown));                         // the opposite view
-        if (ctrl || keys.altKey.isPressed || keys.shiftKey.isPressed) return; // those belong to the game
-        if (keys.numpad5Key.wasPressedThisFrame) ToggleOrtho();
-        if (ortho && (keys.numpadPlusKey.wasPressedThisFrame || keys.numpadMinusKey.wasPressedThisFrame))
+        // Ctrl 把这个视图翻到反面（除非这个视图自己的按键就要按着 Ctrl）。
+        bool Other(string id) => ctrl && !Keybinds.NeedsCtrl(id);
+        if (Keybinds.Pressed("front")) LookFrom(Other("front") ? Vector3.forward : Vector3.back);
+        if (Keybinds.Pressed("side")) LookFrom(Other("side") ? Vector3.right : Vector3.left);
+        if (Keybinds.Pressed("top")) LookFrom(Other("top") ? Vector3.up : Vector3.down);
+        if (Keybinds.Pressed("opposite")) LookFrom(-(held ?? shown));
+        // 往后只认裸键：Ctrl、Alt、Shift 连同它们属于游戏（除非那个功能就是带着修饰键绑的）。
+        bool Plain(string id) => Keybinds.Pressed(id) && (Keybinds.NeedsCtrl(id) || !(ctrl || keys.altKey.isPressed || keys.shiftKey.isPressed));
+        if (Plain("ortho")) ToggleOrtho();
+        bool zoomIn = Plain("zoomIn"), zoomOut = !zoomIn && Plain("zoomOut");
+        if (ortho && (zoomIn || zoomOut))
         {
-            orthoZoom = Math.Clamp(orthoZoom * (keys.numpadPlusKey.wasPressedThisFrame ? 1.25f : 0.8f), 0.1f, 10);
+            orthoZoom = Math.Clamp(orthoZoom * (zoomIn ? 1.25f : 0.8f), 0.1f, 10);
             e?.RequestRedraw(); // the panel's zoom slider follows
         }
         if (e == null) return;
-        if (keys.nKey.wasPressedThisFrame) Flatten(e);
-        else if (keys.tKey.wasPressedThisFrame) LoopCut(e);
-        else if (keys.iKey.wasPressedThisFrame) Inset(e);
-        else if (keys.vKey.wasPressedThisFrame) Bevel(e);
-        else if (keys.uKey.wasPressedThisFrame) SelectFlat(e);
-        else if (keys.oKey.wasPressedThisFrame) { proportional = !proportional; e.RequestRedraw(); Plugin.ModLog.LogInfo($"Proportional editing {(proportional ? "on" : "off")}"); }
+        if (Plain("flatten")) Flatten(e);
+        else if (Plain("loopCut")) LoopCut(e);
+        else if (Plain("inset")) Inset(e);
+        else if (Plain("bevel")) Bevel(e);
+        else if (Plain("selectFlat")) SelectFlat(e);
+        else if (Plain("proportional")) { proportional = !proportional; e.RequestRedraw(); Plugin.ModLog.LogInfo($"Proportional editing {(proportional ? "on" : "off")}"); }
     }
 
     /// Typing in a text box (a part's name): the keys are letters then, not tools.
@@ -791,7 +919,7 @@ public static class MeshTools
                 light.shadows = LightShadows.None;
             }
         if (sun != null) headlight = Headlight(sun);
-        DesignEditor.Instance?.Say(shadowless.Count > 0 ? $"已关闭 {shadowless.Count} 个灯的阴影，按 F5 恢复" : "未找到投射阴影的光源", 3);
+        DesignEditor.Instance?.Say(shadowless.Count > 0 ? $"已关闭 {shadowless.Count} 个灯的阴影，按 {Keybinds.Shown("shadows")} 恢复" : "未找到投射阴影的光源", 3);
         Plugin.ModLog.LogInfo($"Shadows off on {shadowless.Count} lights");
     });
 
@@ -922,7 +1050,7 @@ public static class MeshTools
         }
         fillsAt = -10;
         PlaceFills();
-        DesignEditor.Instance?.Say("全亮已开启：各方向光照均匀、无阴影（按 F7 关闭）", 3);
+        DesignEditor.Instance?.Say($"全亮已开启：各方向光照均匀、无阴影（按 {Keybinds.Shown("fullbright")} 关闭）", 3);
         Plugin.ModLog.LogInfo($"Fullbright on: {fills.Count} point lights round the vehicle, {SunLux(sun) * FillShare:0} lux each on it ({FillShare:P0} of the sun); the renderer draws {MaxDirectional()} directional light(s), so none of those");
     });
 
@@ -1097,7 +1225,7 @@ public static class MeshTools
         flashLight.shadows = LightShadows.None;
         flashLux = SunLux(sun);
         AimFlashlight();
-        DesignEditor.Instance?.Say("手电筒已开启：朝向鼠标所指（按 F6 关闭）", 3);
+        DesignEditor.Instance?.Say($"手电筒已开启：朝向鼠标所指（按 {Keybinds.Shown("flashlight")} 关闭）", 3);
         Plugin.ModLog.LogInfo($"Flashlight on ({FlashShare:P0} of the sun's {flashLux:0} lux where it lands)");
     });
 
@@ -1644,13 +1772,13 @@ public static class MeshTools
         var tip = new UITooltip("网格工具", "展平：把所选点放到同一平面。循环切割：沿某条边穿过的四边面环切一刀。" +
                                 "内插面：生成所选面的缩小副本，外面套一圈。倒角：把所选边变成斜面条。" +
                                 "选择同向相连面：把与所选面同向的相邻面并入选择。");
-        ui.Button("展平（N）", Ui.Callback(() => Flatten(__instance)), ref tip);
+        ui.Button($"展平（{Keybinds.Shown("flatten")}）", Ui.Callback(() => Flatten(__instance)), ref tip);
         ui.Button(FlattenNames[(int)flattenMode], Ui.Callback(() => { flattenMode = (MeshPlans.FlattenMode)(((int)flattenMode + 1) % FlattenNames.Length); __instance.RequestRedraw(); }), ref tip);
-        ui.Button("循环切割（T）：选择一条边", Ui.Callback(() => LoopCut(__instance)), ref tip);
+        ui.Button($"循环切割（{Keybinds.Shown("loopCut")}）：选择一条边", Ui.Callback(() => LoopCut(__instance)), ref tip);
         ui.Slider("内插宽度（毫米）", insetMm, 1, 500, Ui.FloatCallback(v => insetMm = MathF.Round(v)));
-        ui.Button("内插面（I）", Ui.Callback(() => Inset(__instance)), ref tip);
+        ui.Button($"内插面（{Keybinds.Shown("inset")}）", Ui.Callback(() => Inset(__instance)), ref tip);
         ui.Slider("倒角宽度（毫米）", bevelMm, 1, 500, Ui.FloatCallback(v => bevelMm = MathF.Round(v)));
-        ui.Button("倒角（V）：选择边", Ui.Callback(() => Bevel(__instance)), ref tip);
+        ui.Button($"倒角（{Keybinds.Shown("bevel")}）：选择边", Ui.Callback(() => Bevel(__instance)), ref tip);
         var smoothTip = new UITooltip("圆滑边", "把所选边圆滑成几条弧面条。宽度是两侧各切进的距离；分段数决定弧面有几片。镜像生效；Ctrl+Z 一步撤销整个操作。");
         ui.Slider("圆滑宽度（毫米）", smoothMm, 1, 500, Ui.FloatCallback(v => smoothMm = MathF.Round(v)));
         ui.Slider("圆滑分段", smoothSegments, 2, 16, Ui.FloatCallback(v => smoothSegments = Math.Clamp((int)MathF.Round(v), 2, 16)));
@@ -1666,8 +1794,8 @@ public static class MeshTools
         var betweenTip = new UITooltip("选中分割之间的面", "选中最近一次分割在面内部生成的全部小面，不含相邻面。若那次分割已被撤销或改动，请先重做或重新分割。");
         ui.Button("选中分割之间的面", Ui.Callback(() => SelectBetweenSplits(__instance)), ref betweenTip);
         ui.Slider("同向判定角度（°）", flatAngle, 0.5f, 30, Ui.FloatCallback(v => flatAngle = MathF.Round(v * 2) / 2));
-        ui.Button("选择同向相连面（U）", Ui.Callback(() => SelectFlat(__instance)), ref tip);
-        ui.ToggleField("比例编辑（O）", proportional, Ui.BoolCallback(v => proportional = v),
+        ui.Button($"选择同向相连面（{Keybinds.Shown("selectFlat")}）", Ui.Callback(() => SelectFlat(__instance)), ref tip);
+        ui.ToggleField($"比例编辑（{Keybinds.Shown("proportional")}）", proportional, Ui.BoolCallback(v => proportional = v),
             "移动、缩放或旋转点时，会带动周围的点，距离越远影响越小（作用范围即半径）。");
         ui.Slider("比例编辑半径（毫米）", radiusMm, 10, 5000, Ui.FloatCallback(v => radiusMm = MathF.Round(v)));
         ui.Slider("手电筒（% 太阳光强）", Plugin.FlashlightPercent?.Value ?? 80, 5, 300, Ui.FloatCallback(v => { if (Plugin.FlashlightPercent != null) Plugin.FlashlightPercent.Value = MathF.Round(v); }));
@@ -1683,6 +1811,7 @@ public static class MeshTools
         }), "右下角的视图筛选开启质心（COM）后，每个部件画出自己的蓝色质心菱形。关掉它只留整车质心；把 COM 关掉则两种都不画。");
         if (MassMarkers.PartMarkersShown && !MassMarkers.MasterShown)
             ui.InfoField("视图筛选里的 COM 当前是关的，部件质心标记暂时不显示。", 1);
+        ui.InfoField($"正交视图：{Keybinds.Shown("ortho")}。\n{Keybinds.Shown("shadows")} 阴影，{Keybinds.Shown("flashlight")} 手电筒，{Keybinds.Shown("fullbright")} 全亮。", 2);
         ui.ToggleField("允许贴近查看", closeZoom, Ui.BoolCallback(v => closeZoom = v),
             "相机可以贴近小部件到几厘米以内（游戏原本的最近距离远得多）。");
         ui.ToggleField("0.5 毫米网格", halfGrid, Ui.BoolCallback(v =>
@@ -1695,7 +1824,7 @@ public static class MeshTools
             if (Plugin.RotationSnap != null) Plugin.RotationSnap.Value = MathF.Round(v * 4) / 4; // quarter degrees: 3.75° is a 96-sided circle
         }));
         ui.ToggleField("正交：正视视图", orthoLock, Ui.BoolCallback(v => orthoLock = v),
-            "正交视图会吸附到前、后、左右或顶部（旋转视角时在这几者间切换）。小键盘 1 / 3 / 7：前视、侧视、顶视；" +
+            $"正交视图会吸附到前、后、左右或顶部（旋转视角时在这几者间切换）。{Keybinds.Shown("front")} / {Keybinds.Shown("side")} / {Keybinds.Shown("top")}：前视、侧视、顶视；" +
             "加 Ctrl 为后视与另一侧。关闭：自由旋转视角。");
         ui.Slider("正交缩放（%）", orthoZoom * 100, 10, 1000, Ui.FloatCallback(v => orthoZoom = MathF.Round(v) / 100));
         var backTip = new UITooltip("正交视图背景", "场景：按原样显示天空与地图。纯色：不显示天空与地图，只有单一颜色背景（灰、白或黑）上的载具。");
@@ -1704,7 +1833,7 @@ public static class MeshTools
         {
             orthoWhole = v;
             if (!v && ortho) { var cam = Camera.main; if (cam != null && orbit != null) cam.transform.position = orbit.AppliedPosition; }
-        }), "正交视图（小键盘5）：相机会后退，近距离缩放时不会切进车体内部。" +
+        }), $"正交视图（{Keybinds.Shown("ortho")}）：相机会后退，近距离缩放时不会切进车体内部。" +
             "关闭：相机停在游戏原本的位置，近距离缩放会看到车内。");
         ui.ToggleField("正交：尺寸标注", orthoMeasure, Ui.BoolCallback(v => orthoMeasure = v),
             "正交视图从正前、正后、正侧或正上观察时：在屏幕下方标出车体横向总尺寸、" +

@@ -10,9 +10,10 @@ namespace SprocketTools;
 
 /// A "Hotkeys" box beside the panel while a hand-made structure is selected: the mesh editing keys, including the
 /// ones the game's hint bar leaves out (box select, circle select, extrude...). The keys come from the game's live
-/// bindings, so a rebound key shows as rebound. × closes it, F1 shows or hides it; it remembers which.
-/// Also: while moving or scaling, Shift + an axis key locks to the other two axes (Shift + vertical = keep height),
-/// using the game's own two-axis constraints, which it has no key for.
+/// bindings, so a rebound key shows as rebound; our own lines read from Keybinds, so they follow the keys set in
+/// SprocketTools. × closes it, the show/hide key and the keys window key are both changeable, and the title bar drags
+/// the box where it stays. Also: while moving or scaling, Shift + an axis key locks to the other two axes
+/// (Shift + vertical = keep height), using the game's own two-axis constraints, which it has no key for.
 [HarmonyPatch]
 public static class Hotkeys
 {
@@ -82,6 +83,9 @@ public static class Hotkeys
     });
 
     static Rect closeRect; // where the × was drawn last (from the screen's top left); empty while the box is hidden
+    static Rect boxRect, titleRect; // 框本身与它的标题栏，同样只记上一帧画在哪
+    static Vector2? dragAt; // 拖过之后：框停在屏幕上哪儿，不再跟着面板
+    static readonly InputShield.Drag drag = new();
 
     // A label style of our own: the game's has no word wrap, so our longest lines ran past the right edge. Wrapping is
     // also what lets CalcHeight hand back the real height of a line (a wrapped one counts as two). The skin it was
@@ -105,16 +109,22 @@ public static class Hotkeys
 
     internal static void DrawBox()
     {
-        if (!(Plugin.ShowHotkeys?.Value ?? true) || !StructureSelected()) { closeRect = default; return; }
+        if (!(Plugin.ShowHotkeys?.Value ?? true) || !StructureSelected()) { closeRect = boxRect = titleRect = default; return; }
         if (lines == null) { lines = Lines(); heights = null; } // read the keys again, and measure the new lines
-        if (lines.Count == 0) { closeRect = default; return; }
+        if (lines.Count == 0) { closeRect = boxRect = titleRect = default; return; }
         // Left of the game's panel (about the right 23% of the screen), under the top bar.
         const float width = 470, margin = 10;
         // 16 px Chinese glyphs need over 20 px or they lose their bottoms, and 20 px was the line height the box used;
         // ask the style what each line actually takes, and lay the box out from that.
         heights ??= Heights(Style, width - margin * 2);
-        var box = new Rect(Screen.width * 0.765f - width - 12, 90, width, 26 + heights.Sum() + margin);
-        GUI.Box(box, "快捷键  (F1 显示/隐藏)");
+        float boxHeight = 26 + heights.Sum() + margin;
+        // 用标题栏拖过之后就一直停在拖到的地方（记在配置里），没拖过才跟着面板。
+        Vector2 at = dragAt ?? InputShield.Read(Plugin.ShortcutsPosition?.Value) ?? new Vector2(Screen.width * 0.765f - width - 12, 90);
+        var box = new Rect(Math.Clamp(at.x, 0, Math.Max(0, Screen.width - width)),
+                           Math.Clamp(at.y, 0, Math.Max(0, Screen.height - boxHeight)), width, boxHeight);
+        GUI.Box(box, $"快捷键  （{Keybinds.Shown("hotkeys")} 显示/隐藏，{Keybinds.Shown("menu")} 改键，拖动标题栏移动）");
+        boxRect = box;
+        titleRect = new Rect(box.x, box.y, box.width - 30, 24);
         closeRect = new Rect(box.xMax - 26, box.y + 3, 22, 20);
         GUI.Box(closeRect, "×");
         float y = box.y + 26;
@@ -140,11 +150,20 @@ public static class Hotkeys
         return result;
     }
 
-    /// From DesignEditor.Update: F1 and a click on the ×, read from the keyboard and mouse themselves (the simple
-    /// on-screen GUI's own key and button events don't reach mods in this game).
+    /// From DesignEditor.Update: the show/hide key and a click on the ×, read from the keyboard and mouse themselves
+    /// (the simple on-screen GUI's own key and button events don't reach mods in this game).
     internal static void Keys()
     {
-        if (Keyboard.current?.f1Key.wasPressedThisFrame == true) Show(!(Plugin.ShowHotkeys?.Value ?? true));
+        if (MeshTools.Typing() || DrawingSheet.Capturing || PhotoShot.Capturing) return;
+        if (Keybinds.Pressed("hotkeys")) Show(!(Plugin.ShowHotkeys?.Value ?? true));
+        // 指针在框上时游戏的鼠标操作要让路；标题栏按下就能拖动，松手时把位置记进配置。
+        if (boxRect.width > 0 && Mouse.current is { } over)
+        {
+            var mp = over.position.ReadValue();
+            if (drag.Active || boxRect.Contains(new Vector2(mp.x, Screen.height - mp.y))) InputShield.Claim();
+            dragAt = drag.Update(titleRect, boxRect.position, at => { if (Plugin.ShortcutsPosition != null) Plugin.ShortcutsPosition.Value = InputShield.Write(at); });
+            if (drag.Active) return;
+        }
         if (closeRect.width > 0 && Mouse.current is { } mouse && mouse.leftButton.wasPressedThisFrame)
         {
             var p = mouse.position.ReadValue();
@@ -181,20 +200,22 @@ public static class Hotkeys
                     parts.Add($"{key.Replace("Control", "Ctrl")}  {does}");
             if (parts.Count > 0) found.Add(string.Join("     ", parts));
         }
+        static string K(string id) => Keybinds.Shown(id);
         if (controls.FindAction("Core/VerticalConstraint", false) is { } vertical &&
             InputActionRebindingExtensions.GetBindingDisplayString(vertical, default(InputBinding.DisplayStringOptions), (string?)null) is { Length: > 0 } up)
-            found.Insert(5, $"Shift+{up}  移动/缩放时不改高度   [mod]");
-        found.Add("Ctrl+J  将所选附加部件合并到最后选中的那个   [mod]");
+            found.Insert(Math.Min(5, found.Count), $"Shift+{up}  移动/缩放时不改高度   [mod]");
+        found.Add($"{K("join")}  将所选附加部件合并到最后选中的那个   [mod]");
         // 另一个程序集（部件剪贴板）装载时交过来的按键行：它自己画不了这个框，这里的行不来自游戏的绑定表。
         foreach (var line in Extra) found.Add(line);
-        found.Add("N  展平     T  循环切割（需选边）     I  内插面     V  倒角（需选边）   [mod]");
-        found.Add("O  比例编辑     U  选择同向相连面   [mod]");
-        found.Add("小键盘5  正交视图     小键盘 +/-  正交缩放   [mod]");
-        found.Add("小键盘1 / 3 / 7  前视 / 侧视 / 顶视     小键盘9  反向（底部、后部……）   [mod]");
-        found.Add("F2  爆炸视图     F3 / F4  拉近 / 推远   [mod]");
-        found.Add("F5  阴影关闭/开启     F6  跟随鼠标的手电筒     F7  全亮   [mod]");
-        found.Add("F8（拍照模式）  以最高画质设置拍照     F9  工程图纸   [mod]");
-        found.Add("F10  战争雷霆视角资料卡（白底）   [mod]");
+        found.Add($"{K("flatten")}  展平     {K("loopCut")}  循环切割（需选边）     {K("inset")}  内插面     {K("bevel")}  倒角（需选边）   [mod]");
+        found.Add($"{K("proportional")}  比例编辑     {K("selectFlat")}  选择同向相连面   [mod]");
+        found.Add($"{K("ortho")}  正交视图     {K("zoomIn")} / {K("zoomOut")}  正交缩放   [mod]");
+        found.Add($"{K("front")} / {K("side")} / {K("top")}  前视 / 侧视 / 顶视     {K("opposite")}  反向（底部、后部……）   [mod]");
+        found.Add($"{K("explode")}  爆炸视图     {K("explodeCloser")} / {K("explodeFurther")}  拉近 / 推远   [mod]");
+        found.Add($"{K("shadows")}  阴影关闭/开启     {K("flashlight")}  跟随鼠标的手电筒     {K("fullbright")}  全亮   [mod]");
+        found.Add($"{K("photo")}（拍照模式）  以最高画质设置拍照     {K("drawing")}  工程图纸   [mod]");
+        found.Add($"{K("card")}  战争雷霆视角资料卡（白底）     {K("obj")}  OBJ 导出 / 导入菜单   [mod]");
+        found.Add($"{K("menu")}  按键与设置窗口   [mod]");
         return found;
     }
 

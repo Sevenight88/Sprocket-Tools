@@ -21,8 +21,8 @@ internal static class Card
     /// Mutually exclusive with F8's max-quality photo, which owns the renderer while it runs.
     internal static void Keys()
     {
-        if (busy || PhotoShot.Capturing || DesignEditor.Instance is not { } editor || Keyboard.current is not { } keys || MeshTools.Typing()) return;
-        if (!keys.f10Key.wasPressedThisFrame) return;
+        if (busy || PhotoShot.Capturing || DesignEditor.Instance is not { } editor || MeshTools.Typing()) return;
+        if (!Keybinds.Pressed("card")) return;
         if (DrawingSheet.Capturing) return;
         busy = true;
         // A coroutine that never started must not leave busy true for the rest of the session.
@@ -51,31 +51,14 @@ internal static class Card
             Directory.CreateDirectory(dir);
             int azimuth = 90 - offSide;   // the side offset counts from the profile view (offset 90 = head-on at the front)
             if (!sheet.AimAt(azimuth, elevation, wide, high, fov, side, fill)) yield break;
-            if (Plugin.CardLightingProbe?.Value == true)
-            {
-                DesignEditor.Instance?.Say($"资料卡探针：连拍 {Variants.Length} 组打光，机位不变……", 10);
-                foreach (var v in Variants)
-                {
-                    sheet.Apply(v);
-                    for (int f = 0; f < FirstSettle; f++) { sheet.Hold(); PlaceFills(); yield return null; }
-                    if (sheet.Grab(wide, high) is not { } shot) continue;
-                    var probeFile = Path.Combine(dir, $"资料卡探针 {v.No} {v.Name}.png");
-                    Drawing.SavePng(probeFile, wide, high, shot, rgba: !white);
-                    Plugin.ModLog.LogInfo($"CARD_PROBE {v.No} {v.Name} -> {probeFile}");
-                }
-                DesignEditor.Instance?.Say($"资料卡探针完成：{Variants.Length} 张已存到 Photos 目录", 8);
-            }
-            else
-            {
-                var v = Recipe(); // 打光：按配置选探针里的那一组；0=不动
-                if (v != null) sheet.Apply(v);
-                for (int f = 0; f < FirstSettle; f++) { sheet.Hold(); PlaceFills(); yield return null; }
-                if (sheet.Grab(wide, high) is not { } picture) yield break;
-                var file = Path.Combine(dir, $"资料卡 {Name()}.png");
-                Drawing.SavePng(file, wide, high, picture, rgba: !white);
-                Plugin.ModLog.LogInfo($"CARD_SAVED side offset {offSide} elevation {elevation} {(side > 0 ? "right" : "left")} fov {fov:0} framing {fill * 100:0}% lighting {(v == null ? "0 as-is" : $"{v.No} {v.Name}")} {wide}x{high} backdrop {(white ? "white" : "transparent")} -> {file}");
-                DesignEditor.Instance?.Say($"资料卡已保存：{file}", 6);
-            }
+            var v = Recipe(); // 打光：按配置 [Picture] Lighting recipe 选那一组；0=不动
+            if (v != null) sheet.Apply(v);
+            for (int f = 0; f < FirstSettle; f++) { sheet.Hold(); PlaceFills(); yield return null; }
+            if (sheet.Grab(wide, high) is not { } picture) yield break;
+            var file = Path.Combine(dir, $"资料卡 {Name()}.png");
+            Drawing.SavePng(file, wide, high, picture, rgba: !white);
+            Plugin.ModLog.LogInfo($"CARD_SAVED side offset {offSide} elevation {elevation} {(side > 0 ? "right" : "left")} fov {fov:0} framing {fill * 100:0}% lighting {(v == null ? "0 as-is" : $"{v.No} {v.Name}")} {wide}x{high} backdrop {(white ? "white" : "transparent")} -> {file}");
+            DesignEditor.Instance?.Say($"资料卡已保存：{file}", 6);
         }
         finally
         {
@@ -269,16 +252,16 @@ internal static class Card
 
     const float ProbeFillShare = 0.15f;   // of the sun's lux, per probe fill light
 
-    /// 正常出图用哪组打光：配置 [Picture] Lighting recipe，编号跟探针那 8 张一一对应；0 或写错=不加，跟以前那张一样。
+    /// 正常出图用哪组打光：配置 [Picture] Lighting recipe 的编号对应下面 `Variants` 那一格；0 或写错=不加，跟以前那张一样。
     static Variant? Recipe()
     {
         int no = Plugin.CardLightingRecipe?.Value ?? 5;
         return no > 0 ? Variants.FirstOrDefault(v => v.No == no) : null;
     }
 
-    // ---------- the probe's own lights, sun and grade ----------
-    // All three are stood up per variant and taken down in Sheet.End, so a probe that dies halfway leaves the
-    // scene as it found it. The fill lights carry the "PhotoCard" name so Sun() keeps filtering them out.
+    // ---------- 打光用的补光灯、太阳与色调 ----------
+    // 每一组都是拍之前立起来、Sheet.End 收掉，所以中途出错也不会把灯留在场景里。
+    // 补光灯的 GameObject 名带 "PhotoCard"，Sun() 靠它把这些排除掉。
 
     static readonly List<GameObject> probeFills = new();
     static Light? probedSun;

@@ -1,0 +1,13 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "镍铬装甲",
+    "rhaFactor": 1.25,
+    "spallFactor": 0.0004,
+    "density": 7900,
+    "costMultiplier": 2
+  },
+  "type": "nickelChromiumArmour",
+  "date": "1900.01.01"
+}

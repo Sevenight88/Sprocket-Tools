@@ -26,5 +26,5 @@ public static class GunLength
                      "炮口制退器不计入，与真实火炮量法一致", 4);
     });
 
-    static string Calibers(int lengthMm, int caliberMm) => caliberMm > 0 ? (lengthMm / (float)caliberMm).ToString("0.##") : "0";
+    internal static string Calibers(int lengthMm, int caliberMm) => caliberMm > 0 ? (lengthMm / (float)caliberMm).ToString("0.##") : "0";
 }

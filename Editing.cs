@@ -1,6 +1,7 @@
 using BepInEx;
 using HarmonyLib;
 using Il2CppInterop.Runtime;
+using Il2CppInterop.Runtime.Attributes;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using Sprocket.UI;
 using Sprocket.VehicleDesigner;
@@ -57,6 +58,7 @@ public sealed class DesignEditor : MonoBehaviour
         return true;
     }
 
+    [HideFromIl2Cpp]
     internal void RequestEdit(string name, string done, Func<string, EditResult> change)
     {
         if (busy || CaptureBlocked()) return;
@@ -68,6 +70,7 @@ public sealed class DesignEditor : MonoBehaviour
 
     /// An edit applied in place as one of the game's undoable steps (Ctrl+Z), falling back to loading the edited
     /// design when it can't be (a changed part shares its mesh, or applying in place fails).
+    [HideFromIl2Cpp]
     internal void RequestLiveEdit(string name, string done, Func<string, AddonEdits.EditPlan> change)
     {
         if (busy || CaptureBlocked()) return;
@@ -83,6 +86,7 @@ public sealed class DesignEditor : MonoBehaviour
     /// its twin's) the game duplicates the part (and its twin), then the copies take their faces and the part keeps the
     /// rest. The result is saved to memory and checked against the planned design; if anything differs (or the part is a
     /// hull or turret, which can't be duplicated into an add-on), the planned design is loaded instead.
+    [HideFromIl2Cpp]
     internal void RequestSeparate(string name, string done, Func<string, (string Json, List<List<(int Source, int Added)>> Groups, string Log)> plan)
     {
         if (busy || CaptureBlocked()) return;
@@ -112,6 +116,7 @@ public sealed class DesignEditor : MonoBehaviour
 
     /// Null when done in place; else why not (nothing changed then, or the check found a difference and the planned
     /// design is about to be loaded over it).
+    [HideFromIl2Cpp]
     private string? SeparateInPlace(string original, string planned, List<List<(int Source, int Added)>> groups)
     {
         var byId = new Dictionary<int, VehicleObject>();
@@ -293,17 +298,17 @@ public sealed class DesignEditor : MonoBehaviour
             }
     }
 
-    /// Ctrl+J, as in Blender: the selected add-ons join the last add-on, turret or hull selected (the active one).
+    /// 合并附加部件的按键（默认 Ctrl+J，和 Blender 一样，可在按键窗口里改）：把选中的附加部件并入最后选中的那个
+    /// 附加部件、炮塔或车体（活动部件）。
     private void JoinHotkey()
     {
-        var keys = UnityEngine.InputSystem.Keyboard.current;
-        if (keys == null || !keys.ctrlKey.isPressed || !keys.jKey.wasPressedThisFrame || CaptureBlocked()) return;
+        if (!Keybinds.Pressed("join") || CaptureBlocked()) return;
         var picked = SelectedParts();
         var addons = SelectedParts(Conversion.AddonGuid);
         var bodies = SelectedParts(Conversion.CompartmentGuid);
         int target = picked.LastOrDefault(v => addons.Contains(v) || bodies.Contains(v), -1);
         var others = addons.Where(v => v != target).ToList();
-        if (target < 0 || others.Count == 0) { Say("Ctrl+J：先选要合并的附加部件，最后选它们并入的附加部件、炮塔或车体。", 5); return; }
+        if (target < 0 || others.Count == 0) { Say($"{Keybinds.Shown("join")}：先选要合并的附加部件，最后选它们并入的附加部件、炮塔或车体。", 5); return; }
         Plugin.ModLog.LogInfo($"Ctrl+J: joining {string.Join(", ", others)} into {target} (selection order {string.Join(", ", picked)})");
         RequestLiveEdit("正在合并附加部件", $"已把 {others.Count} 个附加部件合并到最后选中的部件。", json => AddonEdits.PlanMerge(json, target, others, LiveShapes(json)));
     }
@@ -316,6 +321,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// Parts currently selected in the editor, optionally only those of one part type.
+    [HideFromIl2Cpp]
     internal List<int> SelectedParts(string? guid = null)
     {
         var selection = core?.Editor?.SelectionReader;
@@ -331,6 +337,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// Every part of the vehicle being edited.
+    [HideFromIl2Cpp]
     internal IEnumerable<VehicleObject> AllParts()
     {
         if (core?.Target == null) yield break;
@@ -339,6 +346,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// Every component of every part of the vehicle being edited.
+    [HideFromIl2Cpp]
     internal IEnumerable<VehicleComponent> AllComponents()
     {
         if (core?.Target == null) yield break;
@@ -350,8 +358,49 @@ public sealed class DesignEditor : MonoBehaviour
 
     private bool liveShapesFailed;
 
+    /// 没有形状数据的部件（舱盖、潜望镜、车轮、履带等）在游戏里显示的包围盒，供布料披挂时挡住布料。
+    internal Dictionary<int, List<(System.Numerics.Vector3 A, System.Numerics.Vector3 B, System.Numerics.Vector3 C)>> PartBoxes()
+    {
+        var boxes = new Dictionary<int, List<(System.Numerics.Vector3 A, System.Numerics.Vector3 B, System.Numerics.Vector3 C)>>();
+        foreach (var part in AllParts())
+        {
+            if (Each(part.Components).Any(c => c?.TryCast<PlateStructure>() != null) || part.GetComponent<VehicleTransform>() is not { } t) continue;
+            var list = new List<(System.Numerics.Vector3 A, System.Numerics.Vector3 B, System.Numerics.Vector3 C)>();
+            foreach (var filter in part.GetComponentsInChildren<MeshFilter>())
+            {
+                if (filter.sharedMesh is not { } mesh || filter.GetComponent<MeshRenderer>() is not { enabled: true } || !filter.gameObject.activeInHierarchy
+                    || filter.GetComponentInParent<VehicleObject>()?.Pointer != part.Pointer) continue;
+                var bounds = mesh.bounds;
+                var c = new System.Numerics.Vector3[8];
+                for (int i = 0; i < 8; i++)
+                {
+                    var at = t.WorldToVehicleSpace(filter.transform.TransformPoint(new Vector3((i & 1) != 0 ? bounds.max.x : bounds.min.x,
+                        (i & 2) != 0 ? bounds.max.y : bounds.min.y, (i & 4) != 0 ? bounds.max.z : bounds.min.z)));
+                    c[i] = new(at.x, at.y, at.z);
+                }
+                var mid = c.Aggregate(System.Numerics.Vector3.Zero, (s, q) => s + q) / 8;
+                foreach (int axis in new[] { 1, 2, 4 })
+                    foreach (int side in new[] { 0, axis })
+                    {
+                        var (u, v) = axis == 1 ? (2, 4) : axis == 2 ? (1, 4) : (1, 2);
+                        var q = new[] { side, side | u, side | u | v, side | v }.Select(i => c[i]).ToArray();
+                        var normal = System.Numerics.Vector3.Cross(q[1] - q[0], q[2] - q[0]);
+                        var outside = (q[0] + q[1] + q[2] + q[3]) / 4 - mid;
+                        if (outside.LengthSquared() < 1e-12f) outside = side == 0 ? -normal : normal;
+                        if (System.Numerics.Vector3.Dot(normal, outside) < 0) System.Array.Reverse(q);
+                        list.Add((q[0], q[1], q[2]));
+                        list.Add((q[0], q[2], q[3]));
+                    }
+            }
+            if (list.Count > 0) boxes[(int)part.VUID] = list;
+        }
+        return boxes;
+    }
+
+
     /// Where the game shows each part's shape (shape coordinates to vehicle space, by the game's own conversion), for the
     /// saved parts and the images of parts it shows twice. Null if the game won't say: edits then use the design's maths.
+    [HideFromIl2Cpp]
     internal AddonEdits.LiveShapes? LiveShapes(string savedJson)
     {
         if (liveShapesFailed) return null;
@@ -389,6 +438,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// Turret rings of every selected turret, whether its ring or its body was clicked.
+    [HideFromIl2Cpp]
     internal List<int> SelectedTurretRings()
     {
         var rings = new List<int>();
@@ -410,24 +460,39 @@ public sealed class DesignEditor : MonoBehaviour
     public void Update()
     {
         // The per-frame features each on their own: one that fails (every frame) is logged once and stops no other.
+        Ui.Guard("Keys window", ToolsMenu.Update);
+        Ui.Guard("Stabilizer hooks", Stabilizer.RetryPending);
         Ui.Guard("Editor lookup", () =>
         {
-            if (Time.unscaledTime >= nextLookup)
+            // 还有攒着的设计器挂点时逐帧找一次：0.5 秒的节流可能让设计器先建好第一版面板，那样小节要等下一次刷新才出现。
+            if (Time.unscaledTime >= nextLookup || Hooks.Pending > 0)
             {
                 nextLookup = Time.unscaledTime + 0.5f;
                 bool wasInEditor = core != null;
                 core = UnityEngine.Object.FindObjectOfType<VehicleDesignerCore>();
+                if (core != null) Plugin.AttachDesignerHooks(); // #79 A：设计器一出现就把那批挂点接完（一次性，见 [timing] 日志）
                 // A design load makes a new target: forget which rings were filled so one whose mirroring was refused
                 // (the twin still empty) can be tried again, while a finished one is skipped by the twin's own parts.
                 // A design load makes a new target: forget which twins were filled so one whose mirroring was refused
                 // (the twin still empty) can be tried again, while a finished one is skipped by the twin's own parts.
                 if ((core?.Target?.Pointer ?? IntPtr.Zero) != lastMirrorTarget) { lastMirrorTarget = core?.Target?.Pointer ?? IntPtr.Zero; wasPlacing = false; filledRings.Clear(); filledCopies.Clear(); }
-                if (wasInEditor && core == null) { MeshTools.LeftEditor(); ExplodedView.LeftEditor(); GearSpeeds.LeftEditor(); } // editor-only views end with it
+                // 离开编辑器时的收尾逐条各自跑：一条抛异常（比如这个版本没有它要的那个类）不能把后面的全带走——
+                // 上游 1.8.6/1.8.7 在 0.2.55.5 上就是「速度与加速」一抛，「网格」小节的状态再也没清，进过一次编辑器后面板全没了。
+                if (wasInEditor && core == null)
+                    foreach (var (feature, leave) in new (string, Action)[] { ("Mesh tools", MeshTools.LeftEditor), ("Exploded view", ExplodedView.LeftEditor),
+                                 ("Gear speeds", GearSpeeds.LeftEditor), ("OBJ menu", ObjTransfer.LeftEditor) })
+                        Ui.Guard(feature, leave); // editor-only views end with it
             }
             ready = core != null && core.HasEditor && core.editorState == VehicleDesignerCore.EditorState.Running;
         });
         if (ready) Ui.Guard("Panel fit", PanelFit.Tick);
-        if (ready && !busy) Ui.Guard("Ctrl+J", JoinHotkey);
+        // The OBJ menu and the keys window are modal panels of our own: while either is up (or for a frame after it
+        // closes) our own editor hotkeys and background feature pumps stay out of the way, so clicks and typing only
+        // reach the panel.
+        Ui.Guard("OBJ menu", ObjTransfer.Update);
+        bool menu = ObjTransfer.BlocksInput || ToolsMenu.IsOpen;
+        if (ready && !busy && !menu) Ui.Guard("右键菜单", RightClickMenu.Update);
+        if (ready && !busy && !menu) Ui.Guard("Ctrl+J", JoinHotkey);
         // A bare ring exists only once the game's own placing has finished, and the editor can be rebuilt before the next
         // tick comes round, so also check on the very frame the placing ends.
         bool placingJustEnded = false;
@@ -438,12 +503,12 @@ public sealed class DesignEditor : MonoBehaviour
             wasPlacing = placing;
             if (placingJustEnded) nextTurretCheck = Time.unscaledTime + 0.5f;
         });
-        if (ready && !busy && placingJustEnded)
+        if (ready && !busy && placingJustEnded && !menu)
         {
             Ui.Guard("Turret mirror", FillMirroredTurrets);
             if (!busy) Ui.Guard("Turret copy", FillCopiedTurrets);
         }
-        if (ready)
+        if (ready && !menu)
         {
             Ui.Guard("Mesh tools keys", MeshTools.Keys);
             Ui.Guard("Exploded view", ExplodedView.Keys);
@@ -451,9 +516,11 @@ public sealed class DesignEditor : MonoBehaviour
             Ui.Guard("Hotkeys", Hotkeys.Keys);
             Ui.Guard(GearSpeeds.LogTag, GearSpeeds.Update);
         }
-        Ui.Guard("Photo", PhotoShot.Update);
-        if (ready) Ui.Guard("Drawing sheet", DrawingSheet.Update);
-        if (ready) Ui.Guard("Photo card", Card.Keys);
+        // 指针停在快捷键框上时（Keys 里认下的）这帧游戏的鼠标操作是关着的，离开就交还给游戏。
+        Ui.Guard("Mouse over our boxes", ready ? InputShield.Update : InputShield.Release);
+        if (!menu) Ui.Guard("Photo", PhotoShot.Update);
+        if (ready && !menu) Ui.Guard("Drawing sheet", DrawingSheet.Update);
+        if (ready && !menu) Ui.Guard("Photo card", Card.Keys);
         // Design edits: a failure ends the edit (so the editor isn't left busy) and says why.
         try
         {
@@ -499,6 +566,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// The click also reaches the game's editor; if that started an operation, wait (~2 s at 60 fps) for it to finish.
+    [HideFromIl2Cpp]
     private bool EditorIdle(System.Action retry)
     {
         if (!ready || core == null) throw new Exception("请先在编辑器中打开一个载具。");
@@ -585,6 +653,7 @@ public sealed class DesignEditor : MonoBehaviour
     /// the design before and after the edit (the same reader a reload uses). Everything is checked before anything changes.
     /// A change as one of the game's own undoable steps: `apply` runs now (and again on Ctrl+Y), `undo` on Ctrl+Z.
     /// False (nothing done) when there's no editor to hold the step.
+    [HideFromIl2Cpp]
     internal bool Undoable(string name, System.Action apply, System.Action undo)
     {
         var ops = core?.Editor?.operations;
@@ -610,6 +679,7 @@ public sealed class DesignEditor : MonoBehaviour
         return done;
     }
 
+    [HideFromIl2Cpp]
     private void ApplyInPlace(AddonEdits.EditPlan plan, string original)
     {
         var byId = new Dictionary<int, VehicleObject>();
@@ -670,6 +740,7 @@ public sealed class DesignEditor : MonoBehaviour
     }
 
     /// The plate meshes of a design, by mesh id, as the game reads them from the blueprint.
+    [HideFromIl2Cpp]
     private Dictionary<int, PlateStructureMeshBlueprint> Meshes(string designJson)
     {
         var found = new Dictionary<int, PlateStructureMeshBlueprint>();
@@ -682,6 +753,7 @@ public sealed class DesignEditor : MonoBehaviour
     /// A changed part's live shape may only be shared with other changed parts (its mirror twin): otherwise swapping it
     /// would change that part too. Checked on the live objects, then by a trial swap and a save to memory, where only
     /// the changed parts may differ.
+    [HideFromIl2Cpp]
     private void CheckOnlyTargetsChange(List<MeshSwap> changes, AddonEdits.EditPlan plan, string original, Dictionary<int, VehicleObject> byId)
     {
         var owners = new Dictionary<IntPtr, List<int>>();
@@ -748,8 +820,12 @@ public sealed class DesignEditor : MonoBehaviour
     {
         if (PhotoShot.Capturing) return; // nothing of ours in the photo
         Ui.Guard("IMGUI font", Ui.CjkFont); // before any of the three below caches a GUIStyle of its own
-        Ui.Guard("Hotkeys", Hotkeys.DrawBox);
-        Ui.Guard("Measurements", MeshTools.DrawMeasures);
+        if (!ObjTransfer.BlocksInput)
+        {
+            Ui.Guard("Hotkeys", Hotkeys.DrawBox);
+            Ui.Guard("右键菜单", RightClickMenu.Draw);
+            Ui.Guard("Measurements", MeshTools.DrawMeasures);
+        }
         if (Time.unscaledTime > statusUntil || string.IsNullOrEmpty(status)) return;
         float width = Math.Min(620, Screen.width - 40);
         GUI.Box(new Rect((Screen.width - width) / 2, 80, width, 30), status); // below the game's vehicle name bar
@@ -766,8 +842,8 @@ public static class RestoreSection
         var editor = DesignEditor.Instance;
         var ui = layout.TryCast<IGUIElementDrawer>();
         if (editor == null || ui == null || !editor.CanRestore || editor.LastEditedPart != (int)__instance.Component.VehicleObject.VUID) return;
-        Ui.Section(layout, "撤销上一次修改");
-        var tip = new UITooltip("恢复", "重新载入上一次 SprocketTools 修改（炮塔转换、圆形附加部件或合并）之前的设计。");
+        Ui.Section(layout, "恢复上一次修改前");
+        var tip = new UITooltip("恢复", "重新载入上一次 SprocketTools 修改（合并、切割、散落、布料披挂、炮塔转换等）之前的设计。");
         ui.Button("恢复到上次修改前的设计", Ui.Callback(editor.RequestRestore), ref tip);
     });
 }

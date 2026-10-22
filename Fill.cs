@@ -1,34 +1,34 @@
-﻿using System.Numerics;
+using System.Numerics;
 
 namespace SprocketTools;
 
-/// Fills a flat region (an outer loop, maybe with holes) with faces that are easy to edit afterwards. Around a hole: a
-/// ring of quads hugging the rim, then rings that step the vertex count down toward the outer corners (no long thin
-/// fans). A many-sided polygon (like a pocket floor) gets rings stepping in to a centre quad. Anything else gets a
-/// Delaunay triangulation. Triangles are then paired into convex quads wherever they fit. Plain maths, tested offline.
+/// Fills a flat region (an outer loop, maybe with holes) with faces that are easy to edit afterwards: a constrained
+/// Delaunay triangulation (the best possible from the outline's own points: it maximises the smallest angle), refined
+/// with added points inside the region where it allows them (Delaunay refinement, no long thin fans), and triangles
+/// then paired into convex quads wherever they fit. Plain maths, tested offline.
 public static class Fill
 {
     /// A vertex the fill adds: its position, and the existing vertices (with weights) its settings blend from.
     public sealed record Added(Vector3 P, (int V, float W)[] Blend);
 
-    /// How a region is filled: from its own points only (the fewest points; triangles paired into quads), with one ring
-    /// of new points between a hole and the corners (light), with a quad ring hugging the rim and more rings (smooth),
-    /// or with a rectangular box enclosing the cut (rectangle box).
+    /// How a region is filled: from its own points only (the fewest points; triangles paired into quads), with points
+    /// added until no triangle has an angle under 22° where the outline allows it (light), with a ring of quads along
+    /// curved outline and 28° (smooth), or with a rectangular box enclosing the cut (rectangle box).
     public enum Mode { Fewest, Light, Smooth, Rectangle, TriangleBox = Rectangle }
 
-    public static readonly string[] ModeNames = { "最少点", "轻环", "平滑环", "矩形框" };
+    public static readonly string[] ModeNames = { "最少点", "轻量", "平滑", "矩形框" };
 
     /// Faces (vertex indices, turning the same way as `outer`) covering the region between `outer` and `holes`. New
     /// vertices are appended to `pos` and described in `added` (same order).
-    /// Which way each region was filled, for the log and tests ("rings", "cap", "delaunay", "as is").
+    /// Which way each region was filled, for the log and tests ("quality mesh, N points", "delaunay", "as is").
     public static readonly List<string> Paths = new();
 
-    /// `light`: as few new points as will still avoid long thin fans (one ring between a hole and the face's corners).
-    /// Otherwise "smooth": a quad ring hugging the rim plus rings stepping down, more points but all even slices.
-    /// `added` null: no new points at all (fewest faces from the outline's own points).
+    /// `light`: as few new points as will still avoid long thin fans. Otherwise "smooth": a quad ring hugging curved
+    /// outline and evener faces, more points. `added` null: no new points at all (fewest faces from the outline's own points).
     public static List<int[]> Region(List<Vector3> pos, List<int> outer, List<List<int>> holes, Vector3 normal, List<Added>? added, bool light = true, Mode mode = Mode.Fewest)
     {
         var faces = RegionFaces(pos, outer, holes, normal, added, light, mode, out string path);
+        if (Paths.Count >= 4096) Paths.RemoveRange(0,2048);
         Paths.Add(path);
         return faces;
     }
@@ -36,28 +36,107 @@ public static class Fill
     static List<int[]> RegionFaces(List<Vector3> pos, List<int> outer, List<List<int>> holes, Vector3 normal, List<Added>? added, bool light, Mode mode, out string path)
     {
         path = "as is";
-        var plane = new Frame(pos, normal, outer);
         outer = Clean(outer);
         holes = holes.Select(Clean).Where(h => h.Count >= 3).ToList();
         if (outer.Count < 3) return new();
-        if (plane.Area(outer) < 0) plane.Mirror();                         // outer turns counter-clockwise in 2D
-        holes = holes.Select(h => plane.Area(h) > 0 ? Enumerable.Reverse(h).ToList() : h).ToList(); // holes clockwise
+        if (!Finite(normal) || normal.LengthSquared() < 1e-20f || outer.Concat(holes.SelectMany(h => h)).Any(v => v < 0 || v >= pos.Count || !Finite(pos[v])))
+        { path = "invalid region"; return new(); }
+        var plane = new Frame(pos, normal, outer);
+        if (Math.Abs(plane.Area(outer)) < 1e-14) return new();
+        if (holes.Any(h => h.Any(v => !plane.Inside(outer,plane.P(v)))))
+        { path = "hole outside region"; return new(); }
+        // Worked on with the outline counter-clockwise and holes clockwise, each loop starting at its lowest point and the
+        // holes in that order: with the frame above, the result depends only on the shape, never on how its points are
+        // numbered, so a face and its mirror twin are filled alike. Faces are turned back at the end if need be.
+        bool turned = plane.Area(outer) < 0;
+        if (turned) outer = Enumerable.Reverse(outer).ToList();
+        outer = plane.Lowest(outer);
+        holes = holes.Select(h => plane.Lowest(plane.Area(h) > 0 ? Enumerable.Reverse(h).ToList() : h))
+                     .OrderBy(h => plane.P(h[0]).X).ThenBy(h => plane.P(h[0]).Y).ToList();
+        string how = "as is";
+        var rim = outer.Concat(holes.SelectMany(h => h)).ToList();
+        var loops = holes.Select(h => h.Count).Prepend(outer.Count).ToArray();
+        int posBefore = pos.Count, addedBefore = added?.Count ?? 0;
+        var faces = Recall(pos, plane, rim, loops, added, light, mode, ref how) ?? Remember(Faces(), pos, plane, rim, loops, posBefore, added, addedBefore, light, mode, how);
+        path = how;
+        return turned ? faces.Select(f => f.Reverse().ToArray()).ToList() : faces;
 
-        List<int[]>? faces = null;
-        if (holes.Count == 0)
+        List<int[]> Faces()
         {
-            if (outer.Count <= 4 && plane.StrictlyConvex(outer)) return new() { outer.ToArray() };
-            if (added != null && mode != Mode.Rectangle && outer.Count >= 8 && plane.StrictlyConvex(outer)) { faces = Cap(pos, plane, outer, added, light); path = "cap"; }
+            if (holes.Count == 0 && outer.Count <= 4 && plane.StrictlyConvex(outer)) return new() { outer.ToArray() };
+            if (added != null && mode == Mode.Rectangle && holes.Count > 0)
+            {
+                var box = RectangleBox(pos, plane, outer, holes, added);
+                if (box != null) { how = "rectangle box"; return box; }
+            }
+            var tris = Delaunay(plane, outer, holes);
+            how = "delaunay";
+            if (added != null && mode != Mode.Rectangle && tris.Count > 0)
+            {
+                int before = pos.Count;
+                tris = Refine(pos, plane, tris, outer, holes, added, light);
+                how = $"quality mesh, {pos.Count - before} points";
+            }
+            return PairUp(plane, tris, Boundary(outer, holes));
         }
-        else if (added != null && (mode == Mode.Rectangle || mode == Mode.TriangleBox))
+    }
+
+    // ---------- mirror twins ----------
+
+    /// A recent fill: its outline in its frame's 2D coordinates, its faces (numbered: outline points first, then its added
+    /// points), the added points and what each blends from (outline numbers).
+    sealed record Memo(Vector2[] Rim, int[] Loops, List<int[]> Faces, Vector2[] Points, (int V, float W)[][] Blends, bool Adds, bool Light, Mode Mode, string How);
+    static readonly List<Memo> memos = new();
+
+    /// A region whose outline matches one filled recently (a mirror twin has the very same 2D coordinates in its frame)
+    /// gets the same faces: the two sides of a vehicle then match exactly, even where rounding in a cut left their
+    /// outlines a hair apart and a near tie went the other way.
+    static List<int[]>? Recall(List<Vector3> pos, Frame plane, List<int> rim, int[] loops, List<Added>? added, bool light, Mode mode, ref string how)
+    {
+        var at = rim.Select(plane.P).ToArray();
+        Memo[] recent;
+        lock (memos) recent = memos.ToArray();
+        foreach (var m in recent)
         {
-            faces = RectangleBox(pos, plane, outer, holes, added);
-            path = faces != null ? "rectangle box" : "delaunay (rectangle box didn't fit)";
-            if (faces != null) return faces;
+            if (!m.Loops.SequenceEqual(loops) || m.Adds != (added != null) || m.Light != light || m.Mode != mode) continue;
+            var map = new int[at.Length];
+            bool same = true;
+            for (int j = 0; j < at.Length && same; j++)
+            {
+                map[j] = Array.FindIndex(at, p => (p - m.Rim[j]).LengthSquared() < 1e-10f);
+                same = map[j] >= 0;
+            }
+            if (!same || map.Distinct().Count() != map.Length) continue;
+            int first = pos.Count;
+            for (int k = 0; k < m.Points.Length; k++)
+            {
+                pos.Add(plane.At(m.Points[k]));
+                added!.Add(new Added(pos[^1], m.Blends[k].Select(b => (rim[map[b.V]], b.W)).ToArray()));
+            }
+            how = m.How + " (as a recent fill of the same outline, e.g. its mirror twin)";
+            return m.Faces.Select(f => f.Select(i => i < at.Length ? rim[map[i]] : first + i - at.Length).ToArray()).ToList();
         }
-        else if (added != null && holes.Count == 1) { faces = Annulus(pos, plane, outer, holes[0], added, light); path = faces != null ? "rings" : WhyNotRings(plane, outer, holes[0]); }
-        if (faces == null) { faces = Delaunay(plane, outer, holes); path = holes.Count == 1 && added != null ? path : "delaunay"; }
-        return PairUp(plane, faces, Boundary(outer, holes));
+        return null;
+    }
+
+    static List<int[]> Remember(List<int[]> faces, List<Vector3> pos, Frame plane, List<int> rim, int[] loops, int first, List<Added>? added, int addedBefore, bool light, Mode mode, string how)
+    {
+        var mine = added?.Skip(addedBefore).ToList();
+        int count = pos.Count - first;
+        if (count != (mine?.Count ?? 0)) return faces;
+        var slot = new Dictionary<int, int>();
+        for (int j = 0; j < rim.Count; j++) slot.TryAdd(rim[j], j);
+        int Slot(int v) => v >= first ? rim.Count + v - first : slot.GetValueOrDefault(v, -1);
+        // Only a fill made purely of its outline and its own added points can be replayed.
+        if (faces.Any(f => f.Any(v => Slot(v) < 0)) || mine != null && mine.Any(a => a.Blend.Any(b => !slot.ContainsKey(b.V)))) return faces;
+        lock (memos)
+        {
+            if (memos.Count >= 64) memos.RemoveAt(0);
+            memos.Add(new Memo(rim.Select(plane.P).ToArray(), loops, faces.Select(f => f.Select(Slot).ToArray()).ToList(),
+                Enumerable.Range(first, count).Select(plane.P).ToArray(), mine?.Select(a => a.Blend.Select(b => (slot[b.V], b.W)).ToArray()).ToArray() ?? Array.Empty<(int, float)[]>(),
+                added != null, light, mode, how));
+        }
+        return faces;
     }
 
     // ---------- rectangle box ----------
@@ -216,143 +295,323 @@ public static class Fill
         return a;
     }
 
-    // ---------- rings ----------
-
-    /// One hole inside a face: a quad ring hugging the rim, then rings with fewer vertices shaped like the outer loop
-    /// (their corners line up with its corners), so each band steps the count down in small, even slices.
-    static List<int[]>? Annulus(List<Vector3> pos, Frame plane, List<int> outer, List<int> hole, List<Added> added, bool light)
-    {
-        var ccwHole = Enumerable.Reverse(hole).ToList();
-        var c = plane.Centroid(ccwHole);
-        if (!plane.Sees(ccwHole, c) || !plane.Sees(outer, c)) return null; // rings need both loops round the hole's centre
-        var coarse = new List<int>();
-        if (light)
-        {
-            // One ring shaped like the outline, twice its corner count, when the hole has enough points to need it.
-            if (ccwHole.Count > 2 * outer.Count) coarse.Add(Math.Min(2 * outer.Count, ccwHole.Count / 2));
-        }
-        else
-            for (int n = ccwHole.Count / 2; n >= 2 * outer.Count && coarse.Count < 2; n /= 2) coarse.Add(n);
-        var holeAngles = ccwHole.Select(v => plane.Angle(v, c)).ToList();
-        // Try the full set of rings, then fewer, until they sit neatly inside one another.
-        foreach (var layout in new[] { coarse, coarse.Skip(coarse.Count - 1).ToList(), new List<int>() }.Distinct())
-        {
-            int mark = pos.Count, addedMark = added.Count;
-            int rings = (light ? 0 : 1) + layout.Count;
-            var loops = new List<List<int>> { ccwHole };
-            if (!light) loops.Add(Ring(holeAngles, 1f / (rings + 1)));  // a quad ring hugging the rim
-            for (int k = 0; k < layout.Count; k++)
-                loops.Add(Ring(plane.Spread(outer, c, layout[k]), light ? 0.45f : (k + 2f) / (rings + 1)));
-            loops.Add(outer);
-            var faces = new List<int[]>();
-            for (int k = 0; k + 1 < loops.Count && faces != null; k++)
-            {
-                bool nested = plane.Nested(loops[k], loops[k + 1]);
-                var band = nested ? Zipper(plane, loops[k], loops[k + 1], c) : null;
-                if (band == null) misfit = $"layout [{string.Join(",", layout)}] band {k}: {(nested ? "a slice turned inside out" : "rings overlap")}"
-;
-                faces = band == null ? null : faces.Concat(band).ToList();
-            }
-            if (faces != null) return faces;
-            pos.RemoveRange(mark, pos.Count - mark);
-            added.RemoveRange(addedMark, added.Count - addedMark);
-        }
-        return null;
-
-        List<int> Ring(List<double> angles, float t)
-        {
-            var ring = new List<int>();
-            foreach (var a in angles)
-            {
-                var (inner, ia, ib, iw) = plane.RayHit(ccwHole, c, a);
-                var (outerHit, oa, ob, ow) = plane.RayHit(outer, c, a);
-                var p = Vector3.Lerp(inner, outerHit, t);
-                pos.Add(p);
-                added.Add(new Added(p, new[] { (ia, (1 - t) * (1 - iw)), (ib, (1 - t) * iw), (oa, t * (1 - ow)), (ob, t * ow) }));
-                ring.Add(pos.Count - 1);
-            }
-            return ring;
-        }
-    }
-
-    static string misfit = "";
-
-    static string WhyNotRings(Frame plane, List<int> outer, List<int> hole)
-    {
-        var ccw = Enumerable.Reverse(hole).ToList();
-        var c = plane.Centroid(ccw);
-        return !plane.Sees(ccw, c) ? "delaunay (hole not round enough)" : !plane.Sees(outer, c) ? "delaunay (outline doesn't go round the hole)" : $"delaunay (rings didn't fit: {misfit})";
-    }
-
-    /// A many-sided convex polygon: rings stepping in toward the middle, halving the vertex count, ending in one face.
-    static List<int[]> Cap(List<Vector3> pos, Frame plane, List<int> outer, List<Added> added, bool light)
-    {
-        var c2 = plane.Centroid(outer);
-        var c = plane.At(c2);
-        int mark = pos.Count, addedMark = added.Count;
-        var origin = outer.Distinct().ToDictionary(v => v, v => v); // settings of a ring vertex come from the outer vertex it was scaled from
-        var loops = new List<List<int>> { outer };
-        var from = outer;
-        // Light: one ring of about a quarter of the points; smooth: halve the points ring by ring down to four.
-        int step = light ? Math.Max(2, outer.Count / Math.Max(4, outer.Count / 4)) : 2;
-        while (from.Count > 4 && (!light || loops.Count == 1))
-        {
-            var ring = new List<int>();
-            foreach (int v in from.Where((_, i) => i % step == 0))
-            {
-                var p = c + (pos[v] - c) * (light ? 0.5f : 0.6f);
-                pos.Add(p);
-                added.Add(new Added(p, new[] { (origin[v], 1f) }));
-                origin[pos.Count - 1] = origin[v];
-                ring.Add(pos.Count - 1);
-            }
-            loops.Add(ring);
-            from = ring;
-        }
-        var faces = new List<int[]>();
-        for (int k = 0; k + 1 < loops.Count; k++)
-        {
-            var band = plane.Nested(loops[k + 1], loops[k]) ? Zipper(plane, loops[k + 1], loops[k], c2) : null;
-            if (band == null)
-            {
-                pos.RemoveRange(mark, pos.Count - mark);
-                added.RemoveRange(addedMark, added.Count - addedMark);
-                return Delaunay(plane, outer, new());
-            }
-            faces.AddRange(band);
-        }
-        faces.AddRange(from.Count <= 4 ? new List<int[]> { from.ToArray() } : Delaunay(plane, from, new())); // the middle, paired into quads later
-        return faces;
-    }
-
-    /// Joins two nested loops around centre c (both turning counter-clockwise) with triangles, walking both in angle
-    /// order so each triangle spans a small slice; equal loops come out as pairs that make quads. Null if a triangle
-    /// would come out inside out (the loops don't wind round c together).
-    static List<int[]>? Zipper(Frame plane, List<int> inner, List<int> outer, Vector2 c)
-    {
-        // Start at the pair of vertices closest in angle, then at each step close whichever triangle has the shorter
-        // new edge (and doesn't come out inside out).
-        double a0 = plane.Angle(inner[0], c);
-        int start = Enumerable.Range(0, outer.Count).OrderBy(j => Math.Abs(Wrap(plane.Angle(outer[j], c) - a0))).First();
-        var ro = Enumerable.Range(0, outer.Count).Select(j => outer[(start + j) % outer.Count]).ToList();
-        int n = inner.Count, m = ro.Count;
-        var faces = new List<int[]>();
-        int i = 0, j = 0;
-        while (i < n || j < m)
-        {
-            int[]? viaInner = i < n ? new[] { inner[(i + 1) % n], inner[i % n], ro[j % m] } : null;
-            int[]? viaOuter = j < m ? new[] { ro[j % m], ro[(j + 1) % m], inner[i % n] } : null;
-            bool innerOk = viaInner != null && plane.Area(viaInner) > 1e-14, outerOk = viaOuter != null && plane.Area(viaOuter) > 1e-14;
-            if (!innerOk && !outerOk) return null;
-            bool takeInner = innerOk && (!outerOk ||
-                Vector2.DistanceSquared(plane.P(inner[(i + 1) % n]), plane.P(ro[j % m])) <= Vector2.DistanceSquared(plane.P(inner[i % n]), plane.P(ro[(j + 1) % m])));
-            faces.Add(takeInner ? viaInner! : viaOuter!);
-            if (takeInner) i++; else j++;
-        }
-        return faces;
-    }
-
     static int[] Turned(Frame plane, params int[] tri) => plane.Area(tri) >= 0 ? tri : new[] { tri[0], tri[2], tri[1] };
+
+    // ---------- quality mesh ----------
+
+    /// Delaunay refinement (Ruppert/Chew, with Üngör's off-centres, as in Shewchuk's Triangle): wherever a triangle has
+    /// an angle under the target, a point goes inside the region where it makes that triangle good. Points never go on
+    /// the outline (neighbouring faces share it) or so near an outline edge that its triangle would be thin. Triangles
+    /// then grade from the outline's short edges out to its long ones, with no fans.
+    static List<int[]> Refine(List<Vector3> pos, Frame plane, List<int[]> start, List<int> outer, List<List<int>> holes, List<Added> added, bool light)
+    {
+        double theta = (light ? 22 : 28) * Math.PI / 180, ratio = 1 / (2 * Math.Sin(theta));
+        // A point seeing an outline edge wider than this would make the triangle on that edge thin. The outline can't be
+        // split here, so a long edge has to accept a somewhat flatter triangle than the rest, or nothing could go near it.
+        double lens = Math.PI - 2 * 0.65 * theta;
+        var fixedEdges = Boundary(outer, holes);
+        // Outline edges in the direction that keeps the region on their left (outer counter-clockwise, holes clockwise).
+        var sides = holes.Append(outer).SelectMany(l => l.Select((v, k) => (v, l[(k + 1) % l.Count]))).ToList();
+        var rim = outer.Concat(holes.SelectMany(h => h)).Distinct().ToList();
+        double finest = fixedEdges.Min(e => (plane.P(e.Item1) - plane.P(e.Item2)).Length());
+        double scale = finest * finest * 1e-6;
+        // The region's own corner angles: a corner sharper than the target can't be helped by adding points.
+        var corner = new Dictionary<int, double>();
+        foreach (var loop in holes.Append(outer))
+            for (int k = 0; k < loop.Count; k++)
+            {
+                Vector2 v = plane.P(loop[k]), next = plane.P(loop[(k + 1) % loop.Count]) - v, prev = plane.P(loop[(k - 1 + loop.Count) % loop.Count]) - v;
+                double a = Math.Atan2(Cross(next, prev), Vector2.Dot(next, prev));
+                corner[loop[k]] = Math.Min(corner.GetValueOrDefault(loop[k], 2 * Math.PI), a < 0 ? a + 2 * Math.PI : a);
+            }
+        // Triangles (counter-clockwise; null once replaced) and which triangle owns each directed edge.
+        var tris = new List<int[]?>();
+        var owner = new Dictionary<(int, int), int>();
+        foreach (var t in start) Add(plane.Area(t) >= 0 ? t : new[] { t[0], t[2], t[1] });
+        var skip = new HashSet<(int, int, int)>();
+        int first = pos.Count, firstAdded = added.Count;
+        // A region that is its own mirror image (lying across the part's centre line, which is v = 0 in this frame) gets
+        // every added point with its mirror twin, so the editor's Mirror still pairs them.
+        static Vector2 Flip(Vector2 p) => new(p.X, -p.Y);
+        bool symmetric = rim.All(v => rim.Any(w => (plane.P(w) - Flip(plane.P(v))).Length() < 2e-5f));
+        // Smooth: first a layer of points just inside every short-edged (curved) stretch of outline, one per outline
+        // point, so the faces along a hole's or cut's rim come out as a ring of quads.
+        if (!light)
+            foreach (var loop in holes.Append(outer))
+                for (int k = 0; k < loop.Count; k++)
+                {
+                    Vector2 o = plane.P(loop[k]), next = plane.P(loop[(k + 1) % loop.Count]), prev = plane.P(loop[(k - 1 + loop.Count) % loop.Count]);
+                    float step = 0.8f * Math.Min((next - o).Length(), (prev - o).Length());
+                    if (step < 1e-9f) continue;
+                    var inward = Left(o - prev) + Left(next - o);
+                    if (inward.LengthSquared() < 1e-12f) continue;
+                    var x = o + Vector2.Normalize(inward) * (float)(step / Math.Max(0.5, Math.Sin(corner[loop[k]] / 2)));
+                    if (symmetric && Math.Abs(x.Y) < 0.3 * step) x.Y = 0;
+                    if (owner.Keys.All(e => (plane.P(e.Item1) - x).Length() > 0.5 * step)) Place(x);
+                }
+        // Biggest thin triangle first: the long slivers that show go first, so a tiny hole in a big plate isn't graded out
+        // with hundreds of points. Points are capped to a share of the outline's (the fine ones by its rim may stay).
+        int room = light ? rim.Count / 2 + 8 : rim.Count + 16, placed = pos.Count;
+        for (int guard = 0; guard < 3000 && pos.Count - placed < room; guard++)
+        {
+            int worst = -1; double biggest = 0;
+            for (int t = 0; t < tris.Count; t++)
+            {
+                if (tris[t] is not { } tri) continue;
+                var (r, shortest, at) = Shape(tri);
+                if (r <= ratio || r * shortest <= biggest || shortest < 0.5 * finest || skip.Contains(Sorted(tri))) continue;
+                if (corner.TryGetValue(at, out var input) && input < 1.05 * theta) continue; // a sharp corner of the outline
+                (worst, biggest) = (t, r * shortest);
+            }
+            if (worst < 0) break;
+            var x = OffCentre(tris[worst]!);
+            if (symmetric && Math.Abs(x.Y) < 0.3 * Shape(tris[worst]!).Shortest) x.Y = 0; // on the centre line, not a hair off it
+            // Too near an outline edge: Ruppert would split that edge, but neighbouring faces share it, so give it a
+            // good apex instead (if nothing already sits in its way).
+            if (Encroached(x) is { } side)
+                x = Clear(side) ? new[] { 60.0, 45, theta * 180 / Math.PI + 4 }.Select(b => Apex(side, b)).FirstOrDefault(y => Encroached(y) == null, new(float.NaN)) : new(float.NaN);
+            if (float.IsFinite(x.X) && Place(x)) continue;
+            skip.Add(Sorted(tris[worst]!));
+        }
+        Smooth();
+        return tris.Where(t => t != null).ToList()!;
+
+        // Each added point moves toward the middle of its neighbours when that leaves every triangle round it better (its
+        // smallest angle no smaller), then edges are flipped back to Delaunay; a few rounds even out the spacing.
+        void Smooth()
+        {
+            // Mirror twins move together (a point on the centre line stays on it).
+            var twin = new Dictionary<int, int>();
+            if (symmetric)
+                for (int v = first; v < pos.Count; v++)
+                {
+                    var want = Flip(plane.P(v));
+                    int w = Enumerable.Range(first, pos.Count - first).OrderBy(i => (plane.P(i) - want).LengthSquared()).First();
+                    if ((plane.P(w) - want).Length() < 0.1 * finest) twin[v] = w;
+                }
+            for (int round = 0; round < 6; round++)
+            {
+                var star = new Dictionary<int, List<int>>();
+                for (int t = 0; t < tris.Count; t++)
+                    if (tris[t] is { } tri) foreach (int v in tri) if (v >= first) { if (!star.TryGetValue(v, out var l)) star[v] = l = new(); l.Add(t); }
+                foreach (var (v, around) in star)
+                {
+                    var ring = around.SelectMany(t => tris[t]!).Where(w => w != v).Distinct().ToList();
+                    var target = ring.Aggregate(Vector2.Zero, (a, w) => a + plane.P(w)) / ring.Count;
+                    int w = twin.GetValueOrDefault(v, -1);
+                    if (w == v) target.Y = 0;
+                    var moving = w >= 0 && w != v ? new[] { (v, target), (w, Flip(target)) } : new[] { (v, target) };
+                    var near = moving.SelectMany(m => star.GetValueOrDefault(m.Item1, new())).Distinct().ToList();
+                    var was = moving.Select(m => pos[m.Item1]).ToArray();
+                    double before = near.Min(t => SmallestAngle(tris[t]!));
+                    foreach (var (i, to) in moving) pos[i] = plane.At(to);
+                    if (near.Any(t => plane.Area(tris[t]!) <= scale) || near.Min(t => SmallestAngle(tris[t]!)) < before)
+                        for (int k = 0; k < moving.Length; k++) pos[moving[k].Item1] = was[k];
+                }
+                for (int sweep = 0, flipped = 1; flipped > 0 && sweep < 20; sweep++)
+                {
+                    flipped = 0;
+                    foreach (var ((u, v), mine) in owner.ToList())
+                    {
+                        if (tris[mine] == null || fixedEdges.Contains(Key(u, v)) || !owner.TryGetValue((v, u), out int across)) continue;
+                        int p = tris[mine]!.First(w => w != u && w != v), d = tris[across]!.First(w => w != u && w != v);
+                        if (!Inside(tris[mine]!, d) || !plane.StrictlyConvex(new[] { u, d, v, p })) continue;
+                        Kill(mine); Kill(across);
+                        Add(new[] { u, d, p }); Add(new[] { d, v, p });
+                        flipped++;
+                    }
+                }
+            }
+            for (int i = firstAdded; i < added.Count; i++) added[i] = added[i] with { P = pos[first + i - firstAdded] };
+        }
+
+        // d clearly inside the triangle's circumcircle (a tolerance relative to its size, so four points on one circle
+        // never flip back and forth).
+        bool Inside(int[] t, int d)
+        {
+            Vector2 o = plane.P(d), a = plane.P(t[0]) - o, b = plane.P(t[1]) - o, c = plane.P(t[2]) - o;
+            double aa = a.LengthSquared(), bb = b.LengthSquared(), cc = c.LengthSquared(), big = Math.Max(aa, Math.Max(bb, cc));
+            double det = aa * Cross(b, c) - bb * Cross(a, c) + cc * Cross(a, b);
+            return det > 1e-7 * big * big;
+        }
+
+        double SmallestAngle(int[] t)
+        {
+            double least = Math.PI;
+            for (int k = 0; k < 3; k++)
+            {
+                Vector2 o = plane.P(t[k]), a = plane.P(t[(k + 1) % 3]) - o, b = plane.P(t[(k + 2) % 3]) - o;
+                least = Math.Min(least, Math.Atan2(Math.Abs(Cross(a, b)), Vector2.Dot(a, b)));
+            }
+            return least;
+        }
+
+        void Add(int[] t)
+        {
+            for (int k = 0; k < 3; k++) owner[(t[k], t[(k + 1) % 3])] = tris.Count;
+            tris.Add(t);
+        }
+        void Kill(int i)
+        {
+            var t = tris[i]!;
+            for (int k = 0; k < 3; k++) owner.Remove((t[k], t[(k + 1) % 3]));
+            tris[i] = null;
+        }
+
+        // Circumradius over shortest edge, the shortest edge, and the corner with the smallest angle (opposite it).
+        (double Ratio, double Shortest, int At) Shape(int[] t)
+        {
+            Vector2 a = plane.P(t[0]), b = plane.P(t[1]), c = plane.P(t[2]);
+            double ab = (b - a).Length(), bc = (c - b).Length(), ca = (a - c).Length(), area = Math.Abs(Cross(b - a, c - a)) / 2;
+            double shortest = Math.Min(ab, Math.Min(bc, ca));
+            int at = shortest == ab ? t[2] : shortest == bc ? t[0] : t[1];
+            return (area < 1e-20 ? double.MaxValue : ab * bc * ca / (4 * area) / shortest, shortest, at);
+        }
+
+        // On the shortest edge's bisector, toward the circumcentre, only as far as makes a triangle exactly at the target.
+        Vector2 OffCentre(int[] t)
+        {
+            Vector2 a = plane.P(t[0]), b = plane.P(t[1]), c = plane.P(t[2]);
+            var (p, q) = new[] { (a, b), (b, c), (c, a) }.OrderBy(e => (e.Item1 - e.Item2).LengthSquared()).First();
+            var cc = Circumcentre(a, b, c);
+            var m = (p + q) / 2;
+            double reach = (q - p).Length() / 2 / Math.Tan(theta / 2), far = (cc - m).Length();
+            return far <= reach ? cc : m + (cc - m) * (float)(reach / far);
+        }
+
+        // The outline edge x would make the triangle on worse: x sees it wider than the lens allows, and wider than the
+        // corner already opposite it (that corner stays, being the one that sees it widest, so a point seeing it
+        // narrower changes nothing there).
+        (int, int)? Encroached(Vector2 x)
+        {
+            foreach (var (u, w) in sides)
+            {
+                double seen = Seen(u, w, x);
+                if (seen <= lens) continue;
+                if (owner.TryGetValue((u, w), out int t) && tris[t] is { } tri && seen < Seen(u, w, plane.P(tri.First(v => v != u && v != w)))) continue;
+                return (u, w);
+            }
+            return null;
+        }
+
+        double Seen(int u, int w, Vector2 x)
+        {
+            Vector2 a = plane.P(u) - x, b = plane.P(w) - x;
+            return Math.Atan2(Math.Abs(Cross(a, b)), Vector2.Dot(a, b));
+        }
+
+        // No vertex already in the edge's lens (that one would be its triangle's corner whatever we add).
+        bool Clear((int U, int W) side) => !owner.Keys.Select(e => e.Item1).Distinct().Any(v =>
+        {
+            if (v == side.U || v == side.W) return false;
+            Vector2 a = plane.P(side.U) - plane.P(v), b = plane.P(side.W) - plane.P(v);
+            return Cross(plane.P(side.W) - plane.P(side.U), plane.P(v) - plane.P(side.U)) > 0 && Math.Atan2(Math.Abs(Cross(a, b)), Vector2.Dot(a, b)) > lens;
+        });
+
+        // The point inside the region making an isosceles triangle on the edge with base angles of `degrees`.
+        Vector2 Apex((int U, int W) side, double degrees)
+        {
+            Vector2 a = plane.P(side.U), b = plane.P(side.W), along = b - a;
+            var inward = Vector2.Normalize(new Vector2(-along.Y, along.X)); // the region is on each outline edge's left
+            return (a + b) / 2 + inward * (float)(along.Length() / 2 * Math.Tan(degrees * Math.PI / 180));
+        }
+
+        // Split the triangle holding x into three (or, with x on one of its edges, both triangles there into two), then
+        // flip edges (never the outline's) until Delaunay again.
+        // The triangle holding x, and which of its edges x is on (-1: none); null if x is outside, on the outline or too
+        // near a corner. Strictly inside a triangle first; failing that, on an edge (a hair outside both in float maths).
+        (int Home, int OnEdge)? Locate(Vector2 x)
+        {
+            foreach (double slack in new[] { 0, -0.01 })
+                for (int t = 0; t < tris.Count; t++)
+                {
+                    if (tris[t] is not { } tri) continue;
+                    double size = Enumerable.Range(0, 3).Min(k => (plane.P(tri[(k + 1) % 3]) - plane.P(tri[k])).Length());
+                    var side = Enumerable.Range(0, 3).Select(k => Cross(plane.P(tri[(k + 1) % 3]) - plane.P(tri[k]), x - plane.P(tri[k])) / (plane.P(tri[(k + 1) % 3]) - plane.P(tri[k])).Length() / size).ToArray();
+                    if (side.Any(d => d <= slack)) continue;
+                    if (tri.Any(v => (plane.P(v) - x).Length() < 0.2 * size)) return null;
+                    int k0 = Array.IndexOf(side, side.Min());
+                    if (side[k0] >= 0.01) return (t, -1);
+                    // On an edge: it goes onto the edge, which must be an inner one, well between its ends.
+                    Vector2 a = plane.P(tri[k0]), ab = plane.P(tri[(k0 + 1) % 3]) - a;
+                    float along = Vector2.Dot(x - a, ab) / ab.LengthSquared();
+                    return fixedEdges.Contains(Key(tri[k0], tri[(k0 + 1) % 3])) || along < 0.1f || along > 0.9f ? null : (t, k0);
+                }
+            return null;
+        }
+
+        // Adds x, and in a region that is its own mirror image its mirror twin too: both or neither.
+        bool Place(Vector2 x)
+        {
+            bool twin = symmetric && x.Y != 0;
+            if (Encroached(x) != null || twin && Encroached(Flip(x)) != null) return false;
+            var keep = twin ? (Tris: tris.ToList(), Owner: owner.ToList(), Pos: pos.Count, Added: added.Count) : default;
+            if (!Insert(x)) return false;
+            if (!twin || Insert(Flip(x))) return true;
+            tris.Clear(); tris.AddRange(keep.Tris);
+            owner.Clear(); foreach (var (e, t) in keep.Owner) owner[e] = t;
+            pos.RemoveRange(keep.Pos, pos.Count - keep.Pos);
+            added.RemoveRange(keep.Added, added.Count - keep.Added);
+            return false;
+        }
+
+        bool Insert(Vector2 x)
+        {
+            if (Locate(x) is not var (home, onEdge)) return false;
+            var h = tris[home]!;
+            var todo = new Stack<(int, int)>();
+            int p = pos.Count;
+            if (onEdge >= 0)
+            {
+                int a = h[onEdge], b = h[(onEdge + 1) % 3], c = h[(onEdge + 2) % 3];
+                if (fixedEdges.Contains(Key(a, b)) || !owner.TryGetValue((b, a), out int across)) return false;
+                int d = tris[across]!.First(w => w != a && w != b);
+                Vector2 pa = plane.P(a), ab = plane.P(b) - pa;
+                x = pa + ab * (Vector2.Dot(x - pa, ab) / ab.LengthSquared());
+                pos.Add(plane.At(x));
+                Kill(home); Kill(across);
+                Add(new[] { a, p, c }); Add(new[] { p, b, c }); Add(new[] { b, p, d }); Add(new[] { p, a, d });
+                foreach (var e in new[] { (b, c), (c, a), (a, d), (d, b) }) todo.Push(e);
+            }
+            else
+            {
+                pos.Add(plane.At(x));
+                Kill(home);
+                Add(new[] { h[0], h[1], p }); Add(new[] { h[1], h[2], p }); Add(new[] { h[2], h[0], p });
+                foreach (var e in new[] { (h[0], h[1]), (h[1], h[2]), (h[2], h[0]) }) todo.Push(e);
+            }
+            for (int flips = 0; todo.Count > 0 && flips < 4 * tris.Count; flips++)
+            {
+                var (u, v) = todo.Pop();
+                if (fixedEdges.Contains(Key(u, v)) || !owner.TryGetValue((u, v), out int mine) || !owner.TryGetValue((v, u), out int across)) continue;
+                int d = tris[across]!.First(w => w != u && w != v);
+                if (!Inside(tris[mine]!, d) || !plane.StrictlyConvex(new[] { u, d, v, p })) continue;
+                Kill(mine); Kill(across);
+                Add(new[] { u, d, p }); Add(new[] { d, v, p });
+                todo.Push((u, d)); todo.Push((d, v));
+            }
+            var near = rim.OrderBy(v => (plane.P(v) - x).LengthSquared()).Take(3).Select(v => (v, 1 / Math.Max(1e-6f, (plane.P(v) - x).Length()))).ToArray();
+            float total = near.Sum(n => n.Item2);
+            added.Add(new Added(pos[p], near.Select(n => (n.v, n.Item2 / total)).ToArray()));
+            return true;
+        }
+    }
+
+    static Vector2 Left(Vector2 e) => e.LengthSquared() < 1e-24f ? Vector2.Zero : Vector2.Normalize(new Vector2(-e.Y, e.X));
+
+    static (int, int, int) Sorted(int[] t)
+    {
+        var s = t.OrderBy(v => v).ToArray();
+        return (s[0], s[1], s[2]);
+    }
+
+    static Vector2 Circumcentre(Vector2 a, Vector2 b, Vector2 c)
+    {
+        Vector2 ab = b - a, ac = c - a;
+        double d = 2 * Cross(ab, ac);
+        double x = (ac.Y * ab.LengthSquared() - ab.Y * ac.LengthSquared()) / d, y = (ab.X * ac.LengthSquared() - ac.X * ab.LengthSquared()) / d;
+        return a + new Vector2((float)x, (float)y);
+    }
 
     // ---------- general case ----------
 
@@ -369,7 +628,8 @@ public static class Fill
                     double d = Vector2.DistanceSquared(plane.P(hole[i]), plane.P(poly[j]));
                     if (d < best.d && Visible(plane, poly, holes, hole[i], poly[j])) best = (d, i, j);
                 }
-            if (best.i < 0) continue;
+            // Leaving an unbridgeable hole out would fill across it and erase the cut.
+            if (best.i < 0) return new();
             // A corner an earlier bridge joined is in the outline twice: join at the copy whose side the hole is on.
             var q = plane.P(hole[best.i]);
             best.j = Enumerable.Range(0, poly.Count).FirstOrDefault(j => poly[j] == poly[best.j] && Opens(plane, poly, j, q), best.j);
@@ -493,14 +753,43 @@ public static class Fill
             if (plane.Area(quad) <= 0 || !plane.StrictlyConvex(quad)) continue;
             pairs.Add((list[0], list[1], quad, plane.Squareness(quad)));
         }
-        var used = new bool[tris.Count];
-        foreach (var (a, b, quad, _) in pairs.OrderByDescending(p => p.Score))
+        var match = Enumerable.Repeat(-1, tris.Count).ToArray();
+        foreach (var (a, b, _, _) in pairs.OrderByDescending(p => p.Score))
+            if (match[a] < 0 && match[b] < 0) (match[a], match[b]) = (b, a);
+        // Then more quads wherever a chain of re-pairings frees a partner for a lone triangle (augmenting paths, the
+        // matching behind Blossom-Quad, without blossoms: exact for a region without holes, close otherwise).
+        var next = Enumerable.Range(0, tris.Count).Select(_ => new List<int>()).ToArray();
+        var quads = new Dictionary<(int, int), int[]>();
+        foreach (var (a, b, quad, _) in pairs) { next[a].Add(b); next[b].Add(a); quads[(Math.Min(a, b), Math.Max(a, b))] = quad; }
+        for (int s = 0; s < tris.Count; s++)
         {
-            if (used[a] || used[b]) continue;
-            used[a] = used[b] = true;
-            others.Add(quad);
+            if (match[s] >= 0 || next[s].Count == 0) continue;
+            var back = new Dictionary<int, int> { [s] = -1 }; // reached triangle -> the one before it on the chain
+            var queue = new Queue<int>(new[] { s });
+            int free = -1;
+            while (queue.Count > 0 && free < 0)
+            {
+                int x = queue.Dequeue();
+                foreach (int u in next[x])
+                {
+                    if (back.ContainsKey(u)) continue;
+                    back[u] = x;
+                    if (match[u] < 0) { free = u; break; }
+                    if (back.ContainsKey(match[u])) continue;
+                    back[match[u]] = u;
+                    queue.Enqueue(match[u]);
+                }
+            }
+            // Re-pair along the chain: free - x - (x's old partner) - ... - s.
+            for (int u = free; u >= 0;)
+            {
+                int x = back[u], after = x == s ? -1 : back[x];
+                (match[u], match[x]) = (x, u);
+                u = after;
+            }
         }
-        others.AddRange(tris.Where((_, i) => !used[i]));
+        others.AddRange(Enumerable.Range(0, tris.Count).Where(i => match[i] > i).Select(i => quads[(i, match[i])]));
+        others.AddRange(tris.Where((_, i) => match[i] < 0));
         return others;
     }
 
@@ -530,20 +819,8 @@ public static class Fill
     static List<int> Clean(List<int> loop) => loop.Where((v, k) => v != loop[(k + 1) % loop.Count]).ToList();
     static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
     static double Cross(Vector2 a, Vector2 b) => (double)a.X * b.Y - (double)a.Y * b.X;
-    static double Wrap(double a) { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; }
 
-    static List<double> Unwrap(List<double> a, double? first = null)
-    {
-        var r = new List<double> { first ?? a[0] };
-        for (int i = 1; i < a.Count; i++)
-        {
-            double d = a[i] - a[i - 1];
-            while (d <= 0) d += 2 * Math.PI;
-            while (d > 2 * Math.PI) d -= 2 * Math.PI;
-            r.Add(r[^1] + d);
-        }
-        return r;
-    }
+    static bool Finite(Vector3 p) => float.IsFinite(p.X) && float.IsFinite(p.Y) && float.IsFinite(p.Z);
 
     /// The region's plane as 2D coordinates (origin at the first outer vertex).
     sealed class Frame
@@ -551,15 +828,27 @@ public static class Fill
         readonly List<Vector3> pos;
         readonly Vector3 origin;
         Vector3 u, v;
+        /// Mirror-exact: built from the part's own axes, the normal rounded and an origin on a millimetre grid, and
+        /// read from the region's own side of the centre line, so a region and its mirror image (x -> -x) get the very
+        /// same 2D coordinates. One lying across the centre line has it along v = 0.
         public Frame(List<Vector3> pos, Vector3 normal, List<int> outer)
         {
             this.pos = pos;
-            origin = pos[outer[0]];
+            static float Snap(float x, float grid) => MathF.Round(x / grid) * grid;
+            var mid = outer.Aggregate(Vector3.Zero, (a, i) => a + pos[i]) / outer.Count;
+            origin = new Vector3(Snap(mid.X, 1e-3f), Snap(mid.Y, 1e-3f), Snap(mid.Z, 1e-3f));
             var n = Vector3.Normalize(normal);
-            u = Vector3.Normalize(Math.Abs(n.X) < 0.9f ? Vector3.Cross(n, Vector3.UnitX) : Vector3.Cross(n, Vector3.UnitY));
+            n = Vector3.Normalize(new Vector3(Snap(n.X, 1e-6f), Snap(n.Y, 1e-6f), Snap(n.Z, 1e-6f)));
+            u = Vector3.Normalize(new[] { Vector3.UnitY, Vector3.UnitZ }.Select(a => a - Vector3.Dot(a, n) * n).First(a => a.LengthSquared() > 0.1f));
             v = Vector3.Cross(n, u);
+            if (origin.X < 0) v = -v;
         }
-        public void Mirror() => v = -v;
+        /// The loop started at its lowest point (then leftmost).
+        public List<int> Lowest(List<int> loop)
+        {
+            int k = Enumerable.Range(0, loop.Count).OrderBy(i => P(loop[i]).Y).ThenBy(i => P(loop[i]).X).First();
+            return loop.Skip(k).Concat(loop.Take(k)).ToList();
+        }
         public Vector2 P(int i) => new(Vector3.Dot(pos[i] - origin, u), Vector3.Dot(pos[i] - origin, v));
         public Vector3 At(Vector2 p) => origin + p.X * u + p.Y * v;
         public double Area(IList<int> loop)
@@ -568,37 +857,6 @@ public static class Fill
             for (int k = 0; k < loop.Count; k++) s += Cross(P(loop[k]), P(loop[(k + 1) % loop.Count]));
             return s / 2;
         }
-        public Vector2 Centroid(List<int> loop)
-        {
-            double a = 0, x = 0, y = 0;
-            for (int k = 0; k < loop.Count; k++)
-            {
-                Vector2 p = P(loop[k]), q = P(loop[(k + 1) % loop.Count]);
-                double cr = Cross(p, q);
-                a += cr; x += (p.X + q.X) * cr; y += (p.Y + q.Y) * cr;
-            }
-            return Math.Abs(a) < 1e-18 ? loop.Aggregate(Vector2.Zero, (s, i) => s + P(i)) / loop.Count : new Vector2((float)(x / (3 * a)), (float)(y / (3 * a)));
-        }
-        public double Angle(int i, Vector2 c) { var d = P(i) - c; return Math.Atan2(d.Y, d.X); }
-
-        /// About `count` directions from c: every corner of the loop, plus even steps between them.
-        public List<double> Spread(List<int> loop, Vector2 c, int count)
-        {
-            var a = Unwrap(loop.Select(v => Angle(v, c)).ToList());
-            var result = new List<double>();
-            for (int k = 0; k < loop.Count; k++)
-            {
-                double from = a[k], to = k + 1 < loop.Count ? a[k + 1] : a[0] + 2 * Math.PI;
-                int steps = Math.Max(1, (int)Math.Round(count * (to - from) / (2 * Math.PI)));
-                for (int s = 0; s < steps; s++) result.Add(from + (to - from) * s / steps);
-            }
-            return result;
-        }
-
-        /// The inner loop lies inside the outer one and doesn't touch it.
-        public bool Nested(List<int> inner, List<int> outer) =>
-            inner.All(v => Inside(outer, P(v))) && outer.All(v => !Inside(inner, P(v)));
-
         public bool Inside(List<int> loop, Vector2 q)
         {
             bool inside = false;
@@ -608,39 +866,6 @@ public static class Fill
                 if ((a.Y > q.Y) != (b.Y > q.Y) && q.X < a.X + (q.Y - a.Y) / (b.Y - a.Y) * (b.X - a.X)) inside = !inside;
             }
             return inside;
-        }
-        /// Every edge of a counter-clockwise loop has c on its inner side (so rays from c cross the loop once).
-        public bool Sees(List<int> loop, Vector2 c)
-        {
-            for (int k = 0; k < loop.Count; k++)
-            {
-                Vector2 a = P(loop[k]), b = P(loop[(k + 1) % loop.Count]);
-                if (Cross(b - a, c - a) <= 1e-12) return false;
-            }
-            return true;
-        }
-        /// Where the ray from c at `angle` leaves a loop: the point, the edge's two vertices and how far along it.
-        public (Vector3 Point, int A, int B, float W) RayHit(List<int> loop, Vector2 c, double angle)
-        {
-            var dir = new Vector2((float)Math.Cos(angle), (float)Math.Sin(angle));
-            (double t, int k, double s) best = (double.MaxValue, 0, 0);
-            for (int k = 0; k < loop.Count; k++)
-            {
-                Vector2 a = P(loop[k]), b = P(loop[(k + 1) % loop.Count]);
-                var e = b - a;
-                double den = Cross(dir, e);
-                if (Math.Abs(den) < 1e-18) continue;
-                double t = Cross(a - c, e) / den, s = Cross(a - c, dir) / den;
-                // A ray aimed at a corner may pass a hair beside both edges meeting there: allow a little slack.
-                if (t > 0 && s >= -1e-5 && s <= 1 + 1e-5 && t < best.t) best = (t, k, Math.Clamp(s, 0, 1));
-            }
-            if (best.t == double.MaxValue) // missed everything: the corner nearest in angle
-            {
-                int nearest = Enumerable.Range(0, loop.Count).OrderBy(k => Math.Abs(Wrap(Angle(loop[k], c) - angle))).First();
-                return (pos[loop[nearest]], loop[nearest], loop[nearest], 0);
-            }
-            int ia = loop[best.k], ib = loop[(best.k + 1) % loop.Count];
-            return (Vector3.Lerp(pos[ia], pos[ib], (float)best.s), ia, ib, (float)best.s);
         }
         public bool StrictlyConvex(IList<int> loop)
         {

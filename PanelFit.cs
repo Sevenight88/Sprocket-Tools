@@ -31,10 +31,12 @@ internal static class PanelFit
     static readonly Dictionary<long, (Il2CppSystem.Func<float> keep, IntPtr source, float from, float to)> fitted = new();
     static readonly HashSet<string> logged = new();
 
-    [HarmonyPatch(typeof(DynamicGUI.DynamicGUILayout), nameof(DynamicGUI.DynamicGUILayout.Apply))]
+    // 两条都必须带 kind：Hooks.Attach 先判 kind 再判 AtBoot，缺属性的挂点会被静默跳过（既不挂也不报错），
+    // 2026-10-03 那次实跑的 TOOL_HOOKS 就报了「开机名单里没对上 DynamicGUILayout」——不是游戏改名，是这两行漏了属性。
+    [HarmonyPostfix, HarmonyPatch(typeof(DynamicGUI.DynamicGUILayout), nameof(DynamicGUI.DynamicGUILayout.Apply))]
     static void AfterApply(DynamicGUI.DynamicGUILayout __instance) => Fit(__instance);
 
-    [HarmonyPatch(typeof(DynamicGUI.DynamicGUILayout), nameof(DynamicGUI.DynamicGUILayout.Refresh))]
+    [HarmonyPostfix, HarmonyPatch(typeof(DynamicGUI.DynamicGUILayout), nameof(DynamicGUI.DynamicGUILayout.Refresh))]
     static void AfterRefresh(DynamicGUI.DynamicGUILayout __instance) => Fit(__instance);
 
     /// The patches above are the fast path, but a panel that never calls them would then never be fitted: the editor
@@ -49,8 +51,9 @@ internal static class PanelFit
         foreach (var panel in panels) Fit(panel);
         if (swept) return;
         swept = true;
-        Plugin.ModLog.LogInfo($"TOOL_FIT sweep: {panels.Length} panels, {layouts} layouts, {rows} rows, {fields} label fields, " +
-                              $"{taller} grown, {labels} labels wanting room ({blocked} of them capped)");
+        // 只在需要排查时打开：启动/开面板时逐条写日志会明显拖慢 UI。
+        // Plugin.ModLog.LogInfo($"TOOL_FIT sweep: {panels.Length} panels, {layouts} layouts, {rows} rows, {fields} label fields, " +
+        //                       $"{taller} grown, {labels} labels wanting room ({blocked} of them capped)");
     }
 
     static void Fit(DynamicGUI.DynamicGUILayout layout) => Ui.Guard("Panel fit", () =>
@@ -81,6 +84,7 @@ internal static class PanelFit
             Restore(row);
             touched |= Description(element, row);
             touched |= Labels(row);
+            touched |= ClampControls(row);
         }
         if (touched) list.ForceRelayout();
     }
@@ -150,6 +154,13 @@ internal static class PanelFit
                 if (Left(other) >= right - 1f) movers.Add(other);
             }
             var widen = Math.Min(needed - own.width, row.rect.width * LabelCap - own.width);
+            // 右侧控件如果已经贴到行尾，再把它往右推就会顶出面板——这正是“选择框被遮挡”的来源。
+            // 只允许用到控件右边剩余的空隙；没有空隙就保持原样，宁可文字换行/截断，也不能盖住勾选框。
+            foreach (var m in movers)
+            {
+                float slack = row.rect.width - Right(m) - 2f;
+                if (slack < widen) widen = Math.Max(0f, slack);
+            }
             if (widen <= 0.5f || movers.Count == 0)
             {
                 blocked++;
@@ -163,6 +174,32 @@ internal static class PanelFit
             text.SetAllDirty();
             Log($"label width={row.rect.width:F0} have={own.width:F0} need={needed:F0} widen={widen:F0} moved={movers.Count} text={Clip(text.text)}");
             changed = true;
+        }
+        return changed;
+    }
+
+    // 勾选框本身被父面板裁掉：标签放宽后右侧控件贴到行尾，Toggle 的 rect 仍可能越过 row/panel 的右边界。
+    // 这里只把越界的 Toggle 拉回来，并把被压窄到看不见的勾选框恢复到 18px，不动文字和其他控件。
+    static bool ClampControls(RectTransform row)
+    {
+        var changed = false;
+        for (var i = 0; i < row.childCount; i++)
+        {
+            var child = row.GetChild(i);
+            if (child.GetComponent<Toggle>() is null) continue;
+            if (child.TryCast<RectTransform>() is not { } rt) continue;
+            var over = Right(rt) - row.rect.xMax + 2f;
+            if (over > 0.5f)
+            {
+                rt.offsetMax = new Vector2(rt.offsetMax.x - over, rt.offsetMax.y);
+                rt.offsetMin = new Vector2(rt.offsetMin.x - over, rt.offsetMin.y);
+                changed = true;
+            }
+            if (rt.rect.width < 18f)
+            {
+                rt.SetSizeWithCurrentAnchors(RectTransform.Axis.Horizontal, 18f);
+                changed = true;
+            }
         }
         return changed;
     }
@@ -195,8 +232,9 @@ internal static class PanelFit
 
     static void Log(string what)
     {
-        if (logged.Add(what)) Plugin.ModLog.LogInfo($"TOOL_FIT {what}");
-        if (logged.Count > 4000) logged.Clear();
+        // 逐行 TOOL_FIT 只用于校准；默认关闭，避免每次开面板都刷几千行日志。
+        // if (logged.Add(what)) Plugin.ModLog.LogInfo($"TOOL_FIT {what}");
+        // if (logged.Count > 4000) logged.Clear();
     }
 
     static string Clip(string s)

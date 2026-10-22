@@ -156,9 +156,9 @@ public static class MergeFaces
                 // A side along the outline copies the old side it replaces (sharp or not); one across the patch is smooth.
                 bool outline = g.Joined.TryGetValue(FaceMerge.Key(a, b), out var was);
                 var like = (outline ? Edge.GetConnectingEdge(verts[was.From], verts[was.OldNext]) : null) ?? prototype.firstLoop.edge;
-                var e = mesh.CreateEdge(verts[a], verts[b], like);
-                if (outline && like.HasFlag(ElementFlags.Sharp)) e.EnableFlag(ElementFlags.Sharp);
-                else e.DisableFlag(ElementFlags.Sharp);
+                var e = mesh.CreateEdge(verts[a], verts[b], outline ? like : null);
+                const ElementFlags authored = ElementFlags.Selected | ElementFlags.Sharp | ElementFlags.AlternatePlateConnection;
+                e.flags = outline ? like.flags & authored : ElementFlags.None;
                 return e;
             }
         }
@@ -180,8 +180,7 @@ public static class MergeFaces
             var l = face.firstLoop;
             for (int k = 0; k < face.vertexCount; k++, l = l.next)
             {
-                l.thickenMode = old[Id(l.vertex)].thickenMode;
-                l.thickenEdge = old[Id(l.vertex)].thickenEdge;
+                MeshTools.CopyThickening(l, old[Id(l.vertex)]);
             }
         }
         var (rivetsKept, rivetsLost) = rivets.Place(made.Select(m => m.Face), reach: 0.05f);

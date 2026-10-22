@@ -16,21 +16,29 @@ public static class ExplodedView
     // game has since put it back itself, e.g. after you moved that part). Parent space, so the order doesn't matter.
     static readonly List<(Transform T, Vector3 Before, Vector3 After)> moved = new();
     static bool on;
+    internal static bool Active => on;
+    static float nextRefresh;
 
     internal static void Keys()
     {
+        if (PhotoShot.Capturing || DrawingSheet.Capturing || MeshTools.Typing()) return;
         var keys = Keyboard.current;
         if (keys == null) return;
-        if (on && moved.Any(m => Gone(m.T))) { moved.Clear(); Explode(); } // the design was reloaded: new parts
-        if (keys.f2Key.wasPressedThisFrame)
+        if (on && Time.unscaledTime >= nextRefresh)
+        {
+            nextRefresh = Time.unscaledTime + 0.5f;
+            if (moved.Any(m => Gone(m.T))) { Collapse(); Explode(); } // 设计被重新读过了：先把还在的部件放回原位再重建视图
+        }
+        if (Keybinds.Pressed("explode"))
         {
             on = !on;
             if (on) Explode(); else Collapse();
-            DesignEditor.Instance?.Say(on ? $"爆炸视图：部件间距 {Spread:0.00} 米（F3 拉近 / F4 推远，F2 复位）" : "爆炸视图关闭", 4);
+            DesignEditor.Instance?.Say(on ? $"爆炸视图：部件间距 {Spread:0.00} 米（{Keybinds.Shown("explodeCloser")} 拉近 / {Keybinds.Shown("explodeFurther")} 推远，{Keybinds.Shown("explode")} 复位）" : "爆炸视图关闭", 4);
         }
-        if (keys.f3Key.wasPressedThisFrame || keys.f4Key.wasPressedThisFrame)
+        bool closer = Keybinds.Pressed("explodeCloser"), further = !closer && Keybinds.Pressed("explodeFurther");
+        if (closer || further)
         {
-            if (Plugin.ExplodeSpread != null) Plugin.ExplodeSpread.Value = Math.Clamp(Spread * (keys.f4Key.wasPressedThisFrame ? 1.25f : 0.8f), 0.05f, 20);
+            if (Plugin.ExplodeSpread != null) Plugin.ExplodeSpread.Value = Math.Clamp(Spread * (further ? 1.25f : 0.8f), 0.05f, 20);
             if (on) { Collapse(); Explode(); }
             DesignEditor.Instance?.Say($"爆炸视图间距：{Spread:0.00} 米", 3);
         }

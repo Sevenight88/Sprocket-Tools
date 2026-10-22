@@ -1,0 +1,13 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "观察窗玻璃",
+    "rhaFactor": 0.15,
+    "spallFactor": 0.0015,
+    "density": 2500,
+    "costMultiplier": 3.5
+  },
+  "type": "visionBlockGlass",
+  "date": "1900.01.01"
+}

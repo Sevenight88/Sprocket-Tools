@@ -587,6 +587,8 @@ public static class ImageAddresses
 
     static void Log(string uri, string? note)
     {
-        if (seen.Add(uri)) Plugin.ModLog.LogInfo($"Image: '{uri}'{(note == null ? "" : ": " + note)}");
+        // 涂装/贴花目录可能有上千张图；逐张写日志会让界面一卡一卡。
+        // 只保留真正找不到文件的情况，且同一路径只报一次。
+        if (note != null && seen.Add(uri)) Plugin.ModLog.LogWarning($"Image not loaded: '{uri}': {note}");
     }
 }

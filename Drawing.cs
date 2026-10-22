@@ -488,6 +488,18 @@ internal static class Drawing
     /// An RGB picture (three bytes a pixel, rows from the bottom) as a PNG file; with rgba set, an RGBA picture (four
     /// bytes a pixel, alpha 0 for the parts to see through). Written beside the destination and moved over it, so a
     /// failed write leaves the picture that was there before rather than a half-file.
+    /// 同一秒内再拍一张也不覆盖前一张：重名时加 (2)、(3)……
+    internal static string UnusedPath(string path)
+    {
+        if (!File.Exists(path)) return path;
+        string folder = Path.GetDirectoryName(path) ?? "", stem = Path.GetFileNameWithoutExtension(path), extension = Path.GetExtension(path);
+        for (int n = 2; ; n++)
+        {
+            string candidate = Path.Combine(folder, $"{stem} ({n}){extension}");
+            if (!File.Exists(candidate)) return candidate;
+        }
+    }
+
     internal static void SavePng(string path, int w, int h, byte[] rgb, bool rgba = false)
     {
         ArgumentNullException.ThrowIfNull(rgb);

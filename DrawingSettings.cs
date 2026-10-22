@@ -26,8 +26,8 @@ public static class DrawingSettings
     {
         var ui = layout.TryCast<IGUIElementDrawer>();
         if (ui == null) return;
-        Ui.Section(layout, "工程图纸（F9）");
-        ui.InfoField("按F9保存工程图纸。\n设置会被记住。", 2);
+        Ui.Section(layout, "工程图纸", "工程图纸（F9）");
+        ui.InfoField($"按 {Keybinds.Shown("drawing")} 保存工程图纸。\n设置会被记住。", 2);
         if (gun != null)
         {
             string stored = Plugin.DrawingHiddenGunLimits?.Value ?? "[]";

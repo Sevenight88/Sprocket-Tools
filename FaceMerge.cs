@@ -116,7 +116,13 @@ public static class FaceMerge
                                       Vector3.Dot(normals[u[0].Face], normals[u[1].Face]) >= SameWay &&
                                       (selected.Contains(u[0].Face) && selected.Contains(u[1].Face) || lines.Contains(key));
         var parent = chosen.ToDictionary(f => f, f => f);
-        int Find(int x) => parent[x] == x ? x : parent[x] = Find(parent[x]);
+        int Find(int x)
+        {
+            // Walked twice rather than recursively: a long joined run would otherwise recurse once per face in it.
+            int root = x; while (parent[root] != root) root = parent[root];
+            while (parent[x] != x) { int next = parent[x]; parent[x] = root; x = next; }
+            return root;
+        }
         foreach (var key in uses.Keys.Where(Inner))
             parent[Find(uses[key][0].Face)] = Find(uses[key][1].Face);
         var patches = chosen.OrderBy(f => f).GroupBy(Find).Select(g => Outline(pos, faces, g.ToList(), Inner)).ToList();
@@ -196,7 +202,6 @@ public static class FaceMerge
     /// Takes out outline points that sit on a straight line in every patch outline they're on, and that nothing kept
     /// uses (or, `runPast`, even if something does: then the point stays for it), from all those outlines at once,
     /// so patches sharing a side stay joined.
-    // ponytail: finds a point's outlines by scanning them all, O(outline points²); index them if selections get huge.
     static void RemoveStraight(IReadOnlyList<Vector3> pos, List<Patch> live, HashSet<int> keep, bool runPast)
     {
         foreach (var p in live)
@@ -207,6 +212,13 @@ public static class FaceMerge
             p.Joined = new();
         }
         var loops = live.SelectMany(p => p.Loops.Select(l => (Patch: p, Loop: l))).ToList();
+        // Indexed by point instead of scanning every outline for it: a big selection is quadratic otherwise.
+        var outlinesAt = new Dictionary<int, List<(Patch Patch, List<int> Loop)>>();
+        foreach (var item in loops) foreach (int v in item.Loop)
+        {
+            if (!outlinesAt.TryGetValue(v, out var at)) outlinesAt[v] = at = new();
+            at.Add(item);
+        }
         for (bool changed = true; changed;)
         {
             changed = false;
@@ -214,7 +226,7 @@ public static class FaceMerge
                 for (int k = 0; k < loop.Count; k++)
                 {
                     int v = loop[k];
-                    var on = loops.Where(x => x.Loop.Contains(v)).ToList();
+                    var on = outlinesAt[v];
                     if (keep.Contains(v) && !runPast || on.Any(x => x.Loop.Count <= 3 || !Straight(pos, x.Loop, x.Loop.IndexOf(v)))) continue;
                     foreach (var (p, l) in on)
                     {

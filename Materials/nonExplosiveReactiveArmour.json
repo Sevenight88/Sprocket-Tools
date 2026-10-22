@@ -1,0 +1,16 @@
+{
+  "v": "0.1",
+  "id": "",
+  "properties": {
+    "displayName": "非爆炸反应装甲",
+    "rhaFactor": 1.3,
+    "spallFactor": 0.0002,
+    "density": 3200,
+    "costMultiplier": 3,
+    "reactiveArmourPossible": true,
+    "eraEffectiveness": 1.8,
+    "neraLayers": 3
+  },
+  "type": "nonExplosiveReactiveArmour",
+  "date": "1900.01.01"
+}
