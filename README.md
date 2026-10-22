@@ -241,3 +241,7 @@ MIT。本仓库的修改与新增部分
 - **sectumsempra** —— 提供材质编辑工具 `SprocketMaterialEditor`（MelonLoader 版，直接改写蓝图 json 里的
   `armourTechID`）的源码，是本仓库「装甲材质」方向的起点：它先行验证了「换材质只需改这一个字段、
   质量与成本由游戏自己重算」这条结论。本仓库按 BepInEx + 设计编辑通道的写法重新实现，未直接沿用其代码。
+- **nytonortaro-lab** —— 分享「Sprocket 0.127 通用模组 · 开发交流包」（`Heat127`／`FireControl127`／`Weld127`
+  三套完整 C# 源码与机制文档）。其中的炮弹机制文档（HEAT／APFSDS／ATGM／APDS／APCR 按弹药架保存、弹药预设、
+  同一门炮的多弹种性能预览、复合装甲按装甲模块免疫 HEAT/ATGM）是本仓库弹道与装甲方向的参照。
+  本仓库在自己的框架（BepInEx 6 IL2CPP + Il2CppInterop）里另写，未使用其源码，弹道与装甲的结论都对着游戏重新核验过。
